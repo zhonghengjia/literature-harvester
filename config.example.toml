@@ -1,0 +1,26 @@
+[general]
+output_root = "~/Documents/Literature"
+max_results = 25
+max_pdf_mb = 100
+request_timeout_seconds = 30
+contact_email = ""
+
+[sources]
+pubmed = true
+crossref = true
+europe_pmc = true
+openalex = true
+semantic_scholar = true
+arxiv = true
+unpaywall = true
+biorxiv_medrxiv = true
+
+[zotero]
+base_url = "http://127.0.0.1:23119/api"
+collection = ""
+create_collection = false
+attachment_mode = "imported_file"
+
+# Put API keys in environment variables, not this file:
+# LITERATURE_HARVESTER_CONTACT_EMAIL, OPENALEX_API_KEY, S2_API_KEY,
+# NCBI_API_KEY. UNPAYWALL_EMAIL remains supported as a source-specific override.
