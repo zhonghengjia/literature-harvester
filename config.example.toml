@@ -1,6 +1,7 @@
 [general]
 output_root = "~/Documents/Literature"
 max_results = 25
+max_candidates = 500
 max_pdf_mb = 100
 request_timeout_seconds = 30
 contact_email = ""
@@ -14,13 +15,27 @@ semantic_scholar = true
 arxiv = true
 unpaywall = true
 biorxiv_medrxiv = true
+# Enrichment passes that find free copies of records the discovery sources
+# already returned. Failed direct candidates also trigger these fallback passes.
+preprint_title_match = true
+core = true
+# Deferred until a fixed-pool marginal-yield test justifies enabling them.
+openaire = false
+doaj = false
+
+[openalex_content]
+# Metadata availability is retained, but the metered content route stays blocked
+# until a verified server-side free-only spending guard is available.
+enabled = false
+free_only = true
+max_files = 0
 
 [zotero]
 base_url = "http://127.0.0.1:23119/api"
 collection = ""
-create_collection = false
 attachment_mode = "imported_file"
 
 # Put API keys in environment variables, not this file:
 # LITERATURE_HARVESTER_CONTACT_EMAIL, OPENALEX_API_KEY, S2_API_KEY,
-# NCBI_API_KEY. UNPAYWALL_EMAIL remains supported as a source-specific override.
+# NCBI_API_KEY, CORE_API_KEY. UNPAYWALL_EMAIL remains supported as a
+# source-specific override. Without a contact email, Unpaywall is skipped.

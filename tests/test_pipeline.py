@@ -12,6 +12,11 @@ from lit_harvest.pipeline import DEFAULT_CONFIG, effective_contact_email  # noqa
 
 
 class PipelineTests(unittest.TestCase):
+    def test_deferred_adapters_are_disabled_by_default(self) -> None:
+        self.assertTrue(DEFAULT_CONFIG["sources"]["core"])
+        self.assertFalse(DEFAULT_CONFIG["sources"]["openaire"])
+        self.assertFalse(DEFAULT_CONFIG["sources"]["doaj"])
+
     def test_contact_email_prefers_private_general_environment_variable(self) -> None:
         config = {**DEFAULT_CONFIG, "general": {**DEFAULT_CONFIG["general"], "contact_email": "file@example.org"}}
         env = {

@@ -23,9 +23,15 @@ class CliTests(unittest.TestCase):
     def test_pdf_only_selects_existing_successful_downloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             pdf = Path(temp_dir) / "paper.pdf"
-            pdf.touch()
+            from reportlab.pdfgen import canvas
+            document = canvas.Canvas(str(pdf))
+            document.drawString(50, 750, "Selected hyperchloremia clinical research article")
+            document.drawString(50, 730, "Alice Smith - doi:10.1234/selected")
+            document.save()
             selected = PaperRecord(
-                title="Selected",
+                title="Selected hyperchloremia clinical research article",
+                doi="10.1234/selected",
+                authors=["Alice Smith"],
                 download_status="downloaded",
                 local_pdf=str(pdf),
             )
@@ -39,8 +45,7 @@ class CliTests(unittest.TestCase):
                 download_status="no_oa_version",
                 local_pdf=str(pdf),
             )
-            with patch.object(CLI, "validate_pdf", return_value=None):
-                result = CLI._select_zotero_records([selected, missing, failed], True)
+            result = CLI._select_zotero_records([selected, missing, failed], True)
         self.assertEqual(result, [selected])
 
     def test_zotero_commands_accept_pdf_only(self) -> None:

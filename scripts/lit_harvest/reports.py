@@ -7,7 +7,9 @@ import re
 from typing import Any
 from urllib.parse import quote
 
+from .coverage import write_coverage
 from .models import PaperRecord
+from .outcomes import collect_population, summarize_outcomes, is_verified_pdf, article_type
 
 
 def _md(value: Any) -> str:
@@ -24,6 +26,8 @@ def _bib_escape(value: str) -> str:
 
 
 def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRecord]) -> None:
+    records = collect_population(manifest, records)
+    metrics = summarize_outcomes(records, manifest.get("settings", {}).get("target_pdfs"))
     run_dir.mkdir(parents=True, exist_ok=True)
     fields = [
         "title",
@@ -40,7 +44,16 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
         "license",
         "sources",
         "download_status",
+        "identity_status",
+        "sha256",
+        "duplicate_of",
+        "retry_at",
+        "article_type",
         "local_pdf",
+        "local_fulltext",
+        "fulltext_format",
+        "retrieval_type",
+        "download_version",
         "download_source",
         "url",
         "failure_reason",
@@ -50,6 +63,7 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
         writer.writeheader()
         for record in records:
             row = record.to_dict()
+            row["article_type"] = article_type(record)
             row["authors"] = "; ".join(record.authors)
             row["sources"] = "; ".join(record.sources)
             writer.writerow({field: row.get(field, "") for field in fields})
@@ -58,13 +72,15 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
         for record in records:
             handle.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
 
-    downloaded = sum(record.download_status in {"downloaded", "already_downloaded"} for record in records)
+    downloaded = metrics["pdf_count"]
+    fulltext_only = metrics["fulltext_only_count"]
     lines = [
         f"# Literature inventory: {manifest.get('query', '')}",
         "",
         f"- Run ID: `{manifest.get('run_id', '')}`",
         f"- Records: {len(records)}",
         f"- PDFs available locally: {downloaded}",
+        f"- JATS-derived readable Markdown (not PDFs): {fulltext_only}",
         "",
         "| # | Title | Year | Journal | DOI/ID | OA | Download | Zotero | Sources |",
         "|---:|---|---:|---|---|---|---|---|---|",
@@ -87,6 +103,8 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
                 f"- DOI: {record.doi or 'Not available'}",
                 f"- PMID/PMCID/arXiv: {record.pmid or '-'} / {record.pmcid or '-'} / {record.arxiv_id or '-'}",
                 f"- Local PDF: {record.local_pdf or 'Not downloaded'}",
+                f"- Other readable full text: {record.local_fulltext or 'Not available'}",
+                f"- Retrieval type/version: {record.retrieval_type or '-'} / {record.download_version or '-'}",
                 "",
                 record.abstract or "Abstract not available from the searched sources.",
                 "",
@@ -111,16 +129,14 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
         bib_entries.append(f"@{entry_type}{{{_bib_key(record, index)},\n{body}\n}}")
     (run_dir / "references.bib").write_text("\n\n".join(bib_entries) + "\n", encoding="utf-8")
 
-    attempted_failures = [
-        PaperRecord.from_dict(item) for item in manifest.get("download_attempts", [])
-    ]
-    write_failure_report(run_dir, records + attempted_failures)
+    write_failure_report(run_dir, records)
     write_zotero_plan(run_dir, records)
     write_run_summary(run_dir, manifest, records)
+    write_coverage(run_dir, manifest, records)
 
 
 def write_failure_report(run_dir: Path, records: list[PaperRecord]) -> None:
-    failed = [record for record in records if record.download_status not in {"downloaded", "already_downloaded"}]
+    failed = [record for record in records if not is_verified_pdf(record)]
     lines = [
         "# PDF retrieval follow-up",
         "",
@@ -138,6 +154,13 @@ def write_failure_report(run_dir: Path, records: list[PaperRecord]) -> None:
             "dead_link": "The reported OA location is no longer available at that URL.",
             "not_pdf": "The candidate returned HTML, an error page, or an invalid PDF.",
             "too_large": "The file or repository package exceeded the configured safety limit.",
+            "landing_unresolved": "The article page did not advertise a PDF location; open it in a normal browser session.",
+            "fulltext_unavailable": "The article is in PMC without a PDF object, and no JATS full text could be retrieved either.",
+            "fulltext_only": "No verified PDF was retrieved; readable prose was saved as Markdown from official JATS XML.",
+            "pending": "Not attempted: the target or selected candidate cap stopped this run. This is not a download failure.",
+            "deferred": "The server's retry deadline must expire before another attempt.",
+            "duplicate_pdf": "These PDF bytes were already counted for another record; they cannot count twice.",
+            "manual_review": "A candidate file or article identity needs review; it is not counted as a verified PDF.",
         }.get(record.download_status, "The automated legal OA routes did not return a usable PDF.")
         lines.extend(
             [
@@ -146,6 +169,8 @@ def write_failure_report(run_dir: Path, records: list[PaperRecord]) -> None:
                 f"- Status: `{record.download_status}`",
                 f"- Reason: {record.failure_reason or 'No verified OA PDF candidate'}",
                 f"- Interpretation: {status_guidance}",
+                f"- Retry after: {record.retry_at or 'No recorded deadline'}",
+                f"- Attempt log entries: {len(record.attempts)}",
             ]
         )
         if record.doi:
@@ -174,7 +199,7 @@ def write_failure_report(run_dir: Path, records: list[PaperRecord]) -> None:
             ]
         )
     if not failed:
-        lines.append("All records with verified candidates were downloaded successfully.\n")
+        lines.append("Every record has a locally available identity-verified PDF.\n")
     (run_dir / "failed_downloads.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -214,23 +239,14 @@ def write_zotero_plan(run_dir: Path, records: list[PaperRecord]) -> None:
 
 
 def write_run_summary(run_dir: Path, manifest: dict[str, Any], records: list[PaperRecord]) -> None:
-    status_counts: dict[str, int] = {}
+    records = collect_population(manifest, records)
+    metrics = summarize_outcomes(records, manifest.get("settings", {}).get("target_pdfs"))
     zotero_counts: dict[str, int] = {}
     for record in records:
-        status_counts[record.download_status] = status_counts.get(record.download_status, 0) + 1
         action = str(record.zotero.get("status") or record.zotero.get("action") or "not_planned")
         zotero_counts[action] = zotero_counts.get(action, 0) + 1
-    summary = {
-        "run_id": manifest.get("run_id"),
-        "query": manifest.get("query"),
-        "record_count": len(records),
-        "download_status_counts": status_counts,
-        "zotero_status_counts": zotero_counts,
-        "source_status": manifest.get("source_status", {}),
-        "target_pdfs": manifest.get("settings", {}).get("target_pdfs"),
-        "target_met": manifest.get("settings", {}).get("target_met"),
-        "failed_candidate_attempts": len(manifest.get("download_attempts", [])),
-    }
-    (run_dir / "run_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    summary = {**metrics, "run_id": manifest.get("run_id"), "query": manifest.get("query"),
+               "zotero_status_counts": zotero_counts, "source_status": manifest.get("source_status", {}),
+               "host_retry_at": manifest.get("host_retry_at", {}),
+               "fallback_source_status": manifest.get("fallback_source_status", {})}
+    (run_dir / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

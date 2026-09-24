@@ -15,6 +15,8 @@ from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, build_opener
 
 from .models import PaperRecord, normalize_doi, normalize_title
+from .identity import PdfValidationError, verify_pdf_identity
+from .downloader import sha256_file
 
 
 class ZoteroError(RuntimeError):
@@ -133,6 +135,9 @@ class ZoteroLocalClient:
         request = Request(url, data=data, headers=request_headers, method=method)
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
+                response_server = response.headers.get("Zotero-Server-ID", "")
+                if self.server_id and response_server and response_server != self.server_id:
+                    raise ZoteroError("Zotero server identity changed during this operation")
                 return response.read(), response.headers, response.status
         except HTTPError as exc:
             body = exc.read(4096).decode("utf-8", "replace")
@@ -338,8 +343,17 @@ class ZoteroLocalClient:
         payload, _, _ = self._json_request(f"/users/0/items/{key}")
         return payload if isinstance(payload, dict) else {}
 
+    def _attachment_md5(self, key: str, parent_key: str) -> str:
+        item = self.get_item(key)
+        data = _item_data(item)
+        if (_item_key(item) != key or data.get("itemType") != "attachment"
+                or data.get("parentItem") != parent_key or data.get("linkMode") != "imported_file"):
+            raise ZoteroError("Attachment readback does not match the exact child/parent relationship")
+        return str(data.get("md5") or "").lower()
+
     def upload_attachment(
-        self, parent_key: str, pdf_path: Path, existing_attachment_key: str = ""
+        self, parent_key: str, pdf_path: Path, existing_attachment_key: str = "",
+        *, checkpoint: Callable[[str], None] | None = None,
     ) -> str:
         attachment_key = existing_attachment_key
         if not attachment_key:
@@ -361,12 +375,21 @@ class ZoteroLocalClient:
             attachment_key = self.create_item(template)
 
         try:
+            # Persist the child before the multi-step upload, including failed readback.
+            if checkpoint:
+                checkpoint(attachment_key)
             pdf_bytes = pdf_path.read_bytes()
             md5 = hashlib.md5(pdf_bytes, usedforsecurity=False).hexdigest()
+            stored_md5 = self._attachment_md5(attachment_key, parent_key)
+            if stored_md5 == md5:
+                # Registration may have completed before a previous reply was lost.
+                return attachment_key
+            if stored_md5:
+                raise ZoteroError("Existing attachment contains a different file; automatic replacement refused")
             metadata = {
                 "md5": md5,
                 "filename": pdf_path.name,
-                "filesize": pdf_path.stat().st_size,
+                "filesize": len(pdf_bytes),
                 "mtime": int(pdf_path.stat().st_mtime * 1000),
             }
             form = urlencode(metadata).encode("ascii")
@@ -378,6 +401,8 @@ class ZoteroLocalClient:
                 authenticated=True,
             )
             if (authorization or {}).get("exists"):
+                if self._attachment_md5(attachment_key, parent_key) != md5:
+                    raise ZoteroError("Attachment exists reply is not confirmed by exact stored-file MD5")
                 return attachment_key
             upload_key = str((authorization or {}).get("uploadKey", ""))
             upload_url = urljoin(self.base_url + "/", str((authorization or {}).get("url", "")))
@@ -393,7 +418,8 @@ class ZoteroLocalClient:
                 upload_url,
                 method="POST",
                 data=upload_body,
-                headers={"Content-Type": str((authorization or {}).get("contentType", "application/octet-stream"))},
+                headers={"Content-Type": str((authorization or {}).get("contentType", "application/octet-stream")),
+                         **({"Zotero-Server-ID": self.server_id} if self.server_id else {})},
             )
             register_form = urlencode({"upload": upload_key}).encode("ascii")
             self._json_request(
@@ -403,7 +429,8 @@ class ZoteroLocalClient:
                 headers={"Content-Type": "application/x-www-form-urlencoded", "If-None-Match": "*"},
                 authenticated=True,
             )
-            self.get_item(attachment_key)
+            if self._attachment_md5(attachment_key, parent_key) != md5:
+                raise ZoteroError("Attachment registration is not confirmed by exact stored-file MD5")
             return attachment_key
         except Exception as exc:
             if isinstance(exc, ZoteroAttachmentError):
@@ -427,6 +454,26 @@ def _item_doi(item: dict[str, Any]) -> str:
 def _item_key(item: dict[str, Any]) -> str:
     data = _item_data(item)
     return str(item.get("key") or data.get("key") or "")
+
+
+_PARTIAL_IMPORT_STATUSES = {
+    "parent_created", "parent_readback_failed", "parent_created_attachment_failed",
+    "parent_created_attachment_unverified",
+}
+
+
+def _verify_parent(client: ZoteroLocalClient, key: str, record: PaperRecord) -> None:
+    item = client.get_item(key)
+    data = _item_data(item)
+    if (_item_key(item) != key or not data.get("itemType")
+            or data.get("itemType") in {"attachment", "note", "annotation"} or data.get("parentItem")):
+        raise ZoteroError("Parent readback does not match the exact bibliographic item")
+    doi = _item_doi(item)
+    if record.doi and doi:
+        if record.doi != doi:
+            raise ZoteroError("Parent readback DOI conflicts with this record")
+    elif not record.normalized_title or normalize_title(str(data.get("title", ""))) != record.normalized_title:
+        raise ZoteroError("Parent readback title does not match this record")
 
 
 def plan_import(records: list[PaperRecord], items: list[dict[str, Any]]) -> dict[str, int]:
@@ -457,8 +504,9 @@ def plan_import(records: list[PaperRecord], items: list[dict[str, Any]]) -> dict
     counts: dict[str, int] = {}
     for record in records:
         previous = record.zotero.copy()
-        if previous.get("item_key") and previous.get("status") == "parent_created_attachment_failed" and record.local_pdf:
-            plan = {**previous, "action": "resume_attachment", "match_reason": "manifest_partial_state"}
+        if previous.get("item_key") and previous.get("status") in _PARTIAL_IMPORT_STATUSES:
+            plan = {**previous, "action": "resume_attachment" if record.local_pdf else "resume_parent",
+                    "match_reason": "manifest_partial_state"}
         elif not record.title:
             plan = {"action": "skip_no_metadata", "match_reason": "missing_title"}
         elif record.doi and record.doi in by_doi:
@@ -471,10 +519,14 @@ def plan_import(records: list[PaperRecord], items: list[dict[str, Any]]) -> dict
         elif record.normalized_title in by_title:
             item = by_title[record.normalized_title]
             key = _item_key(item)
-            action = "attach_existing" if record.local_pdf and key not in pdf_attachments else "skip_exact"
-            plan = {"action": action, "match_reason": "normalized_title", "match_key": key, "item_key": key}
-            if key in pdf_attachments:
-                plan["attachment_key"] = pdf_attachments[key]
+            existing_doi = _item_doi(item)
+            if record.doi and existing_doi and record.doi != existing_doi:
+                plan = {"action": "manual_review", "match_reason": "doi_conflict", "match_key": key}
+            else:
+                action = "attach_existing" if record.local_pdf and key not in pdf_attachments else "skip_exact"
+                plan = {"action": action, "match_reason": "normalized_title", "match_key": key, "item_key": key}
+                if key in pdf_attachments:
+                    plan["attachment_key"] = pdf_attachments[key]
         else:
             best_ratio = 0.0
             best_item: dict[str, Any] | None = None
@@ -501,7 +553,7 @@ def plan_import(records: list[PaperRecord], items: list[dict[str, Any]]) -> dict
             else:
                 plan["status"] = prior_status
             plan["error"] = ""
-        record.zotero = {**previous, **plan}
+        record.zotero = plan
         counts[plan["action"]] = counts.get(plan["action"], 0) + 1
     return counts
 
@@ -527,10 +579,7 @@ def _record_to_item(
     query: str,
 ) -> dict[str, Any]:
     requested_type = "preprint" if record.item_type == "preprint" else "journalArticle"
-    try:
-        template = client.get_template(requested_type)
-    except ZoteroError:
-        template = client.get_template("journalArticle")
+    template = client.get_template(requested_type)
     extra_lines = []
     for label, value in (
         ("PMID", record.pmid),
@@ -576,6 +625,13 @@ def import_records(
     items = client.get_items()
     collections = client.get_collections()
     plan_import(records, items)
+    server_id = getattr(client, "server_id", "")
+    server_id = server_id if isinstance(server_id, str) else ""
+    for record in records:
+        previous_server = record.zotero.get("server_id")
+        if (record.zotero.get("action") in {"resume_attachment", "resume_parent"}
+                and previous_server and previous_server != server_id):
+            raise ZoteroError("Pending import belongs to another Zotero server; refusing to reuse its item keys")
     collection_key = find_collection_key(collections, collection_name)
     if collection_name and not collection_key:
         if not create_collection:
@@ -592,7 +648,7 @@ def import_records(
             record.zotero["status"] = status
             counts[status] = counts.get(status, 0) + 1
             continue
-        if action == "resume_attachment":
+        if action in {"resume_attachment", "resume_parent"}:
             parent_key = str(record.zotero.get("item_key", ""))
         elif action == "attach_existing":
             parent_key = str(record.zotero.get("match_key", ""))
@@ -600,7 +656,7 @@ def import_records(
         elif action == "create":
             try:
                 parent_key = client.create_item(_record_to_item(client, record, collection_key, query))
-                record.zotero.update({"item_key": parent_key, "status": "parent_created"})
+                record.zotero.update({"item_key": parent_key, "status": "parent_created", "server_id": server_id})
                 if checkpoint:
                     checkpoint(records)
             except Exception as exc:
@@ -612,16 +668,49 @@ def import_records(
         else:
             continue
 
+        record.zotero.update({"server_id": server_id, "parent_readback": "pending"})
+        try:
+            _verify_parent(client, parent_key, record)
+            record.zotero.update({"parent_readback": "verified", "error": ""})
+        except ZoteroError as exc:
+            record.zotero.update({"status": "parent_readback_failed", "error": str(exc)})
+            counts["parent_readback_failed"] = counts.get("parent_readback_failed", 0) + 1
+            if checkpoint:
+                checkpoint(records)
+            continue
+
         pdf_path = Path(record.local_pdf) if record.local_pdf else None
         if pdf_path and pdf_path.is_file():
             try:
+                identity = verify_pdf_identity(pdf_path, record)
+                checksum = sha256_file(pdf_path)
+                if identity.status != "verified" or (record.sha256 and checksum != record.sha256):
+                    raise PdfValidationError("manual_review", "PDF identity or recorded checksum no longer agrees with this record")
+                record.identity_status, record.sha256 = "verified", checksum
+                record.extra["pdf_identity"] = identity.to_dict()
+            except (PdfValidationError, OSError) as exc:
+                record.identity_status = "manual_review"
+                record.zotero.update({"status": "parent_created_attachment_unverified", "error": str(exc)})
+                counts["parent_created_attachment_unverified"] = counts.get("parent_created_attachment_unverified", 0) + 1
+                if checkpoint:
+                    checkpoint(records)
+                continue
+            try:
+                def attachment_checkpoint(key: str) -> None:
+                    record.zotero.update({"attachment_key": key, "status": "parent_created",
+                                          "attachment_readback": "pending"})
+                    if checkpoint:
+                        checkpoint(records)
+
                 attachment_key = client.upload_attachment(
-                    parent_key, pdf_path, str(record.zotero.get("attachment_key", ""))
+                    parent_key, pdf_path, str(record.zotero.get("attachment_key", "")),
+                    checkpoint=attachment_checkpoint,
                 )
                 record.zotero.update(
                     {
                         "attachment_key": attachment_key,
                         "status": "attached_pdf_to_existing" if action == "attach_existing" else "imported_with_pdf",
+                        "attachment_readback": "verified",
                         "error": "",
                     }
                 )
