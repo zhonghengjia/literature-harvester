@@ -61,7 +61,8 @@ class ZoteroTests(unittest.TestCase):
         self.assertEqual(counts, {"skip_exact": 1})
         self.assertEqual(record.zotero["item_key"], "PARENT01")
         self.assertEqual(record.zotero["attachment_key"], "ATTACH01")
-        self.assertEqual(record.zotero["status"], "verified_existing_with_pdf")
+        self.assertEqual(record.zotero["status"], "existing_attachment_unverified")
+        self.assertFalse(record.zotero["attachment_verification"]["local_bytes_verified"])
 
 
 if __name__ == "__main__":

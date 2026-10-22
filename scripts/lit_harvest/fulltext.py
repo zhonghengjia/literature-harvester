@@ -12,11 +12,12 @@ from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 from xml.etree import ElementTree
 
-from .http import HttpClient, HttpError, NETWORK_ERRORS, is_public_https_url, redact_url
+from .http import HttpClient, HttpError, NETWORK_ERRORS, is_web_url, redact_url
 from .models import normalize_pmcid
+from .settings import DEFAULT_CONFIG, resource_limit
 
-MAX_LANDING_BYTES = 768 * 1024
-MAX_XML_BYTES = 12 * 1024 * 1024
+MAX_LANDING_BYTES = DEFAULT_CONFIG["resources"]["html_bytes"]
+MAX_XML_BYTES = DEFAULT_CONFIG["resources"]["xml_bytes"]
 
 
 class FullTextError(RuntimeError):
@@ -47,6 +48,10 @@ class _DeclaredPdfParser(HTMLParser):
             name = (values.get("name") or values.get("property") or "").casefold()
             if name in {"citation_pdf_url", "eprints.document_url"} and values.get("content"):
                 self.candidates.append(values["content"])
+        elif tag.casefold() == "a":
+            if values.get("href") and (values.get("type", "").split(";", 1)[0].lower() == "application/pdf"
+                    or values.get("download", "").lower().endswith(".pdf")):
+                self.candidates.append(values["href"])
         elif tag.casefold() == "link":
             rel = {part.casefold() for part in values.get("rel", "").split()}
             media_type = values.get("type", "").casefold().split(";", 1)[0].strip()
@@ -55,7 +60,7 @@ class _DeclaredPdfParser(HTMLParser):
 
 
 def extract_pdf_urls(html: str, base_url: str) -> list[str]:
-    """Return all source-declared public HTTPS URLs, in document order."""
+    """Return source-declared HTTP(S) URLs, preserving document order."""
     parser = _DeclaredPdfParser()
     parser.feed(html)
     parser.close()
@@ -66,7 +71,7 @@ def extract_pdf_urls(html: str, base_url: str) -> list[str]:
             candidate = urlunparse(parsed._replace(fragment=""))
         except ValueError:
             continue
-        if candidate not in results and is_public_https_url(candidate):
+        if candidate not in results and is_web_url(candidate):
             results.append(candidate)
     return results
 
@@ -76,17 +81,20 @@ def extract_pdf_url(html: str, base_url: str) -> str:
     return next(iter(extract_pdf_urls(html, base_url)), "")
 
 
-def _fetch_bounded(client: HttpClient, url: str, limit: int, accept: str) -> tuple[bytes, str, str]:
-    if not is_public_https_url(url):
-        raise FullTextError(f"Not a public HTTPS URL: {redact_url(url)}", code="unsafe_url")
+def _fetch_bounded(client: HttpClient, url: str, limit: int, accept: str, *, sniff_pdf=False) -> tuple[bytes, str, str]:
+    if not is_web_url(url):
+        raise FullTextError(f"Not a valid HTTP(S) URL: {redact_url(url)}", code="unsafe_url")
     try:
         with client.request(url, headers={"Accept": accept}) as response:
-            raw = response.read(limit + 1)
+            raw = response.read(min(1024, limit + 1)) if sniff_pdf else b""
+            pdf_response = sniff_pdf and raw.lstrip().startswith(b"%PDF-")
+            if not pdf_response:
+                raw += response.read(limit + 1 - len(raw))
             if len(raw) > limit:
                 raise FullTextError(f"Response exceeded {limit} bytes", code="body_too_large")
             resolved_url = getattr(response, "url", url) or url
-            if not is_public_https_url(resolved_url):
-                raise FullTextError("Response resolved to an unsafe URL", code="unsafe_url")
+            if not is_web_url(resolved_url):
+                raise FullTextError("Response resolved to an invalid HTTP(S) URL", code="unsafe_url")
             return raw, resolved_url, _decode(raw, response)
     except HttpError:
         raise
@@ -97,11 +105,16 @@ def _fetch_bounded(client: HttpClient, url: str, limit: int, accept: str) -> tup
 
 def resolve_landing_pdfs(client: HttpClient, url: str) -> list[str]:
     """Fetch an already eligible OA page; never infer PDF paths."""
-    _, resolved_base, html = _fetch_bounded(client, url, MAX_LANDING_BYTES,
-                                           "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1")
+    limit = resource_limit(client, "html_bytes")
+    raw, resolved_base, html = _fetch_bounded(client, url, limit,
+                                           "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1", sniff_pdf=True)
+    if raw.lstrip().startswith(b"%PDF-"):
+        # Extensionless repository URLs can serve PDFs directly. This is only
+        # discovery: the downloader still checks full bytes, structure and identity.
+        return [resolved_base]
     candidates = extract_pdf_urls(html, resolved_base)
     if not candidates:
-        raise FullTextError("Landing page declared no public HTTPS PDF metadata", code="no_declared_pdf")
+        raise FullTextError("Landing page declared no valid HTTP(S) PDF metadata", code="no_declared_pdf")
     return candidates
 
 
@@ -155,8 +168,9 @@ def _jats_section(node: ElementTree.Element, depth: int, lines: list[str]) -> in
     return prose_chars
 
 
-def _parse_jats(raw: bytes, expected_pmcid: str = "", *, preserve_namespaces: bool = False) -> ElementTree.Element:
-    if len(raw) > MAX_XML_BYTES:
+def _parse_jats(raw: bytes, expected_pmcid: str = "", *, preserve_namespaces: bool = False,
+                max_bytes: int = MAX_XML_BYTES) -> ElementTree.Element:
+    if len(raw) > max_bytes:
         raise FullTextError("Full-text XML exceeded size limit", code="body_too_large")
     # Do not expand locally declared entities from remote XML. Standard external
     # JATS DOCTYPE declarations are allowed; ElementTree does not fetch them.
@@ -189,15 +203,18 @@ def _parse_jats(raw: bytes, expected_pmcid: str = "", *, preserve_namespaces: bo
     return original if preserve_namespaces else root
 
 
-def jats_to_markdown(raw: bytes, expected_pmcid: str = "") -> str:
+def jats_to_markdown(raw: bytes, expected_pmcid: str = "", *, max_bytes=MAX_XML_BYTES) -> str:
     """Render a prose reader, not a lossless representation of tables/formulas."""
-    root = _parse_jats(raw, expected_pmcid)
+    root = _parse_jats(raw, expected_pmcid, max_bytes=max_bytes)
     body = root.find("./body")
     if body is None:
         raise FullTextError("Full-text XML contained no usable body text", code="no_usable_body")
     body_lines: list[str] = []
-    if _jats_section(body, 2, body_lines) < 400:
+    prose_chars = _jats_section(body, 2, body_lines)
+    if not prose_chars:
         raise FullTextError("Full-text XML contained no usable body text", code="no_usable_body")
+    if prose_chars < 400:
+        body_lines.insert(0, "Short body: verify whether this is a complete short article or a truncated source.\n")
     lines: list[str] = []
     title_node = root.find("./front/article-meta/title-group/article-title")
     if title_node is None:
@@ -233,8 +250,9 @@ def fetch_jats_url(client: HttpClient, url: str, pmcid: str) -> str:
     normalized = normalize_pmcid(pmcid)
     if not normalized:
         raise FullTextError("Not a usable PMCID", code="invalid_identifier")
-    raw, _, _ = _fetch_bounded(client, url, MAX_XML_BYTES, "application/xml")
-    return jats_to_markdown(raw, expected_pmcid=normalized)
+    limit = resource_limit(client, "xml_bytes")
+    raw, _, _ = _fetch_bounded(client, url, limit, "application/xml")
+    return jats_to_markdown(raw, expected_pmcid=normalized, max_bytes=limit)
 
 
 def fetch_jats_fulltext(client: HttpClient, pmcid: str) -> str:

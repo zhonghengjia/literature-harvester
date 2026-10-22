@@ -14,7 +14,6 @@ import importlib.util
 import io
 import json
 from pathlib import Path
-import socket
 import sys
 import tempfile
 import unittest
@@ -99,8 +98,7 @@ class OfflineWorkflowAcceptance(unittest.TestCase):
         self.stack.enter_context(patch.object(cli, "load_config", return_value=self.config))
         self.stack.enter_context(patch.object(pipeline, "_search_one", side_effect=self.discovery))
         self.stack.enter_context(patch.object(HttpClient, "request", side_effect=self.transport))
-        self.stack.enter_context(patch("socket.getaddrinfo", return_value=[
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]))
+        self.stack.enter_context(patch("socket.getaddrinfo", side_effect=AssertionError("DNS forbidden in offline tests")))
         self.stack.enter_context(patch("socket.socket.connect", side_effect=AssertionError("Real network forbidden")))
         self.stack.enter_context(patch.dict("os.environ", {name: "" for name in [
             "OPENALEX_API_KEY", "S2_API_KEY", "NCBI_API_KEY", "CORE_API_KEY",

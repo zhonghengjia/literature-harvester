@@ -11,14 +11,15 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from xml.etree import ElementTree
 
 from .fulltext import FullTextError
-from .http import HttpClient, HttpError, NETWORK_ERRORS, is_public_https_url
+from .http import HttpClient, HttpError, NETWORK_ERRORS, is_https_url
 from .models import normalize_pmcid
+from .settings import DEFAULT_CONFIG, resource_limit
 
 BUCKET_HOST = "pmc-oa-opendata.s3.amazonaws.com"
 BUCKET = "pmc-oa-opendata"
-MAX_LISTING_BYTES = 1024 * 1024
-MAX_LISTING_PAGES = 20
-MAX_ARTICLE_VERSIONS = 100
+MAX_LISTING_BYTES = DEFAULT_CONFIG["resources"]["pmc_listing_bytes"]
+MAX_LISTING_PAGES = DEFAULT_CONFIG["resources"]["pmc_listing_pages"]
+MAX_ARTICLE_VERSIONS = DEFAULT_CONFIG["resources"]["pmc_versions"]
 
 
 def is_pmc_listing_candidate(candidate, url=None):
@@ -59,11 +60,11 @@ def _listing_identity(url: str) -> tuple[str, dict[str, str]]:
 
 
 def _read_listing(client: HttpClient, url: str) -> ElementTree.Element:
-    if not is_public_https_url(url):
-        raise PmcError("unsafe_url", "PMC listing failed public HTTPS validation")
+    if not is_https_url(url):
+        raise PmcError("unsafe_url", "PMC listing failed HTTPS URL validation")
     try:
         with client.request(url, headers={"Accept": "application/xml"}) as response:
-            raw = response.read(MAX_LISTING_BYTES + 1)
+            raw = response.read(resource_limit(client, "pmc_listing_bytes") + 1)
             final_url = getattr(response, "url", url) or url
             requested_id, _ = _listing_identity(url)
             final_id, _ = _listing_identity(final_url)
@@ -74,8 +75,8 @@ def _read_listing(client: HttpClient, url: str) -> ElementTree.Element:
     except NETWORK_ERRORS as exc:
         raise HttpError(f"PMC listing body read failed ({type(exc).__name__})", url=url,
                         code="body_read_failed") from None
-    if len(raw) > MAX_LISTING_BYTES:
-        raise PmcError("body_too_large", "PMC listing exceeded 1 MB")
+    if len(raw) > resource_limit(client, "pmc_listing_bytes"):
+        raise PmcError("body_too_large", "PMC listing exceeded configured byte budget")
     if b"<!ENTITY" in raw.upper():
         raise PmcError("invalid_metadata", "PMC listing contained an entity declaration")
     try:
@@ -105,8 +106,8 @@ def _object_candidate(value: Any, version_id: str, extension: str) -> tuple[str,
     if checksum and not re.fullmatch(r"[0-9a-fA-F]{32}", checksum):
         raise PmcError("invalid_metadata", "PMC object MD5 is invalid")
     url = urlunparse(("https", BUCKET_HOST, parsed.path, "", "", ""))
-    if not is_public_https_url(url):
-        raise PmcError("unsafe_url", "PMC object failed public HTTPS validation")
+    if not is_https_url(url):
+        raise PmcError("unsafe_url", "PMC object failed HTTPS URL validation")
     return url, checksum.lower()
 
 
@@ -119,8 +120,6 @@ def _metadata_candidates(metadata: Any, pmcid: str, number: int) -> list[dict[st
     if normalize_pmcid(metadata.get("pmcid")) != pmcid or int(version_value) != number:
         raise PmcError("identity_mismatch", "PMC metadata does not match the listing identifier and version")
     retracted = _bool(metadata.get("is_retracted"))
-    if retracted is not False:
-        raise PmcError("no_oa_version", "PMC version is retracted or active status is unknown")
     oa = _bool(metadata.get("is_pmc_openaccess"))
     manuscript = _bool(metadata.get("is_manuscript"))
     license_value = metadata.get("license_code")
@@ -139,7 +138,10 @@ def _metadata_candidates(metadata: Any, pmcid: str, number: int) -> list[dict[st
               "version": "acceptedVersion" if manuscript is True else "",
               "pmcid": pmcid, "article_version": number, "oa_route": route,
               "metadata_url": f"https://{BUCKET_HOST}/metadata/{version_id}.json",
-              "is_manuscript": manuscript, "is_pmc_openaccess": oa}
+              "is_manuscript": manuscript, "is_pmc_openaccess": oa,
+              "is_retracted": retracted,
+              "evidence_use": "retracted_do_not_use_as_active_evidence" if retracted else "status_unknown" if retracted is None else "not_flagged_retracted",
+              "version_semantics": "PMC deposit processing version, not publication status"}
     candidates: list[dict[str, Any]] = []
     # TDM permission applies to the text dataset, not to arbitrary PDF/media files.
     fields = [("pdf_url", "pdf", "pdf")] if route == "open_access" else []
@@ -162,7 +164,7 @@ def _metadata_candidates(metadata: Any, pmcid: str, number: int) -> list[dict[st
             candidate["resolver_warnings"] = [{"code": e.code, "message": str(e)} for e in errors]
     if not candidates:
         raise PmcError("no_fulltext_object", "Eligible PMC version has no declared usable PDF or JATS object")
-    return candidates
+    return sorted(candidates, key=lambda c: (c.get("is_manuscript") is True, -(c.get("article_version") or 0)))
 
 
 def resolve_pmc_candidates(client: HttpClient, listing_url: str) -> list[dict[str, Any]]:
@@ -176,7 +178,7 @@ def resolve_pmc_candidates(client: HttpClient, listing_url: str) -> list[dict[st
     versions: set[int] = set()
     tokens: set[str] = set()
     current = listing_url
-    for _ in range(MAX_LISTING_PAGES):
+    for _ in range(resource_limit(client, "pmc_listing_pages")):
         root = _read_listing(client, current)
         if root.findtext("Prefix", f"{pmcid}.") != f"{pmcid}.":
             raise PmcError("identity_mismatch", "PMC listing prefix differs from requested identifier")
@@ -185,7 +187,7 @@ def resolve_pmc_candidates(client: HttpClient, listing_url: str) -> list[dict[st
             if not match or match.group(1) != pmcid:
                 raise PmcError("identity_mismatch", "PMC listing includes a different or malformed article version")
             versions.add(int(match.group(2)))
-        if len(versions) > MAX_ARTICLE_VERSIONS:
+        if len(versions) > resource_limit(client, "pmc_versions"):
             raise PmcError("listing_limit", "PMC article version count exceeded the bounded resolver limit")
         truncated = _bool(root.findtext("IsTruncated", "false"))
         if truncated is False:
@@ -220,4 +222,4 @@ def resolve_pmc_candidates(client: HttpClient, listing_url: str) -> list[dict[st
                     for e in errors]
         for candidate in candidates:
             candidate.setdefault("resolver_warnings", []).extend(warnings)
-    return candidates
+    return sorted(candidates, key=lambda c: (c.get("is_manuscript") is True, -(c.get("article_version") or 0)))

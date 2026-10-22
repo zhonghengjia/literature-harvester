@@ -19,21 +19,54 @@ biorxiv_medrxiv = true
 # already returned. Failed direct candidates also trigger these fallback passes.
 preprint_title_match = true
 core = true
-# Deferred until a fixed-pool marginal-yield test justifies enabling them.
-openaire = false
-doaj = false
+openaire = true
+doaj = true
 
 [openalex_content]
-# Metadata availability is retained, but the metered content route stays blocked
-# until a verified server-side free-only spending guard is available.
+# Explicit spending approval is required before enabling the metered PDF route.
+# Free-only remains non-spending; a daily allowance is not a billing guarantee.
 enabled = false
 free_only = true
 max_files = 0
+allow_paid = false
+max_cost_usd = 0
+
+[transport]
+max_retries = 2
+max_inline_retry_delay = 10
+max_retry_wait = 30
+body_timeout_seconds = 90
+ca_file = ""
+
+[content]
+batch_size = 25
+# Zero processes the whole selected population/all pages.
+max_records = 0
+max_seconds = 0
+page_batch_size = 500
+max_pages = 0
+ocr = "auto"
+ocr_language = "eng"
+ocr_dpi = 150
+asset_limit = 25
+fetch_assets = true
+# Optional shared extraction cache; empty disables it. Contains article text.
+cache_dir = ""
+
+[reading]
+max_chars = 24000
+chunk_chars = 4000
+question_chars = 50000
+
+# Additional resources, search and plan_limits budgets are defined once in
+# scripts/lit_harvest/settings.py. Override only needed keys in private config.
+# Bind trusted config with --config or LITERATURE_HARVESTER_CONFIG.
 
 [zotero]
 base_url = "http://127.0.0.1:23119/api"
 collection = ""
 attachment_mode = "imported_file"
+timeout_seconds = 30
 
 # Put API keys in environment variables, not this file:
 # LITERATURE_HARVESTER_CONTACT_EMAIL, OPENALEX_API_KEY, S2_API_KEY,

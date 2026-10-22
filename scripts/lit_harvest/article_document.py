@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import Counter
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from .fulltext import _parse_jats, FullTextError
 from .identity import _pdf_backend, verify_pdf_identity
 from .models import normalize_doi
+from .settings import DEFAULT_CONFIG, positive
 
-PARSER_VERSION = "article-document/1"
+PARSER_VERSION = "article-document/3"
 
 
 def tag(node):
@@ -31,12 +33,14 @@ def first(node, name):
 def _document(raw_hash, record, format_name):
     return {"schema_version": 1, "parser": PARSER_VERSION, "source_sha256": raw_hash,
             "article": {"title": record.title, "ids": record.identity_keys},
+            "identity_record": {k: getattr(record, k) for k in
+                ("title", "authors", "year", "doi", "pmid", "pmcid", "arxiv_id", "sha256")},
             "format": format_name, "elements": [], "gaps": [],
             "ai_reading_status": "not_submitted"}
 
 
-def jats_document(raw, record):
-    root = _parse_jats(raw, record.pmcid, preserve_namespaces=True)
+def jats_document(raw, record, *, max_bytes=DEFAULT_CONFIG["resources"]["xml_bytes"]):
+    root = _parse_jats(raw, record.pmcid, preserve_namespaces=True, max_bytes=max_bytes)
     meta = first(root, "article-meta")
     if meta is None or not record.pmcid:
         raise FullTextError("Structured JATS requires verified PMCID metadata", code="identity_mismatch")
@@ -45,9 +49,11 @@ def jats_document(raw, record):
     if record.doi and dois and dois != {record.doi}:
         raise FullTextError("JATS DOI conflicts with the requested article", code="identity_mismatch")
     body = next(iter(children(root, "body")), None)
-    if body is None or len(text(body)) < 400:
-        raise FullTextError("JATS body is missing or too short", code="no_usable_body")
+    if body is None or not text(body):
+        raise FullTextError("JATS body is missing or empty", code="no_usable_body")
     doc = _document(hashlib.sha256(raw).hexdigest(), record, "jats")
+    if len(text(body)) < 400:
+        doc["gaps"].append({"reason": "short_body_verify_completeness", "body_chars": len(text(body))})
     paths = {}
     def locate(node, path):
         paths[id(node)] = path
@@ -63,8 +69,12 @@ def jats_document(raw, record):
                    "source_id": node.get("id", ""), **fields}
         doc["elements"].append(element)
         return element
-    known_containers = {"body", "back", "sec", "abstract", "list", "boxed-text", "disp-quote", "ref-list", "fn-group", "app-group", "app", "floats-group", "speech", "statement"}
+    known_containers = {"body", "back", "sec", "abstract", "list", "boxed-text", "disp-quote", "ref-list", "fn-group", "app-group", "app", "floats-group", "speech", "statement", "table-wrap-group", "fig-group", "disp-formula-group"}
+    visited = set()
     def walk(node, section):
+        if id(node) in visited:
+            return
+        visited.add(id(node))
         kind = tag(node)
         heading = next(iter(children(node, "title")), None)
         if kind in known_containers:
@@ -127,15 +137,31 @@ def jats_document(raw, record):
     return doc
 
 
-def pdf_document(path: Path, record, max_pages=500):
+def pdf_document(path: Path, record, max_pages=0, *, page_batch_size=500,
+                 ocr="auto", ocr_language="eng", ocr_dpi=150, page_numbers=None):
+    positive(max_pages, "max_pages", zero=True)
+    positive(page_batch_size, "page_batch_size")
+    positive(ocr_dpi, "ocr_dpi")
+    if ocr not in {"auto", "off"}:
+        raise ValueError("ocr must be auto or off")
+    if page_numbers is not None and (not page_numbers or
+            any(type(p) is not int or p < 1 for p in page_numbers) or len(set(page_numbers)) != len(page_numbers)):
+        raise ValueError("page_numbers must contain unique positive page numbers")
+    def indices(count):
+        chosen = list(range(1, count+1)) if page_numbers is None else sorted(page_numbers)
+        if any(p > count for p in chosen):
+            raise ValueError("Requested page exceeds PDF length")
+        return [p-1 for p in (chosen[:max_pages] if max_pages else chosen)]
     raw_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     if not record.sha256 or record.sha256 != raw_hash:
         raise FullTextError("PDF checksum is absent or changed", code="checksum_conflict")
-    identity = verify_pdf_identity(path, record)
+    identity = verify_pdf_identity(path, record, allow_ocr=ocr == "auto")
     if identity.status != "verified":
         raise FullTextError(identity.reason, code="identity_mismatch")
     backend_name, backend = _pdf_backend()
     doc = _document(raw_hash, record, "pdf")
+    doc["extraction_options"] = {"max_pages": max_pages, "page_batch_size": page_batch_size,
+        "ocr": ocr, "ocr_language": ocr_language, "ocr_dpi": ocr_dpi, "page_numbers": page_numbers}
     doc["backend"] = {"name": backend_name, "version": str(getattr(backend, "VersionBind", "unknown"))}
     pages = []
     def add_page(number, blocks):
@@ -151,10 +177,19 @@ def pdf_document(path: Path, record, max_pages=500):
     if backend_name == "pymupdf":
         with backend.open(path) as pdf:
             count = pdf.page_count
-            for index in range(min(count, max_pages)):
+            for index in indices(count):
                 try:
                     page = pdf[index]
-                    add_page(index+1, [(b[4], list(b[:4])) for b in page.get_text("blocks", sort=True) if len(b) > 6 and b[6] == 0])
+                    blocks = [(b[4], list(b[:4])) for b in page.get_text("blocks", sort=True) if len(b) > 6 and b[6] == 0]
+                    if ocr == "auto" and not any(value.strip() for value, _ in blocks):
+                        try:
+                            textpage = page.get_textpage_ocr(language=ocr_language, dpi=ocr_dpi, full=True)
+                            blocks = [(page.get_text("text", textpage=textpage), None)]
+                            doc.setdefault("ocr_pages", []).append(index+1)
+                        except Exception as exc:
+                            doc["gaps"].append({"page": index+1, "reason": "local_OCR_unavailable_or_failed",
+                                                "error_type": type(exc).__name__})
+                    add_page(index+1, blocks)
                     if page.get_images():
                         doc["gaps"].append({"page": index+1, "reason": "images_not_interpreted"})
                 except Exception as exc:
@@ -164,30 +199,60 @@ def pdf_document(path: Path, record, max_pages=500):
         with path.open("rb") as stream:
             pdf = backend(stream)
             count = len(pdf.pages)
-            for index in range(min(count, max_pages)):
+            for index in indices(count):
                 try:
                     add_page(index+1, [(pdf.pages[index].extract_text() or "", None)])
                 except Exception as exc:
                     pages.append({"page": index+1, "status": "failed", "error_type": type(exc).__name__})
                     doc["gaps"].append({"page": index+1, "reason": "page_extraction_failed"})
-    if count > max_pages:
-        doc["gaps"].append({"reason": "page_limit", "unprocessed_pages": list(range(max_pages+1, count+1))})
+    unprocessed = sorted(set(range(1, count+1)) - {p["page"] for p in pages})
+    if unprocessed:
+        doc["gaps"].append({"reason": "page_limit", "unprocessed_pages": unprocessed})
     doc["gaps"].append({"reason": "PDF_table_formula_figure_structure_not_verified"})
+    processed = len(pages)
     doc["coverage"] = {"page_count": count, "pages": pages, "extraction_status": "partial",
+                       "page_batch_size": page_batch_size, "batches": (processed+page_batch_size-1)//page_batch_size,
                        "semantic_accuracy_verified": False, "supplements_processed": False}
-    if not doc["elements"]:
+    if not doc["elements"] and page_numbers is None:
         raise FullTextError("PDF has no extractable text", code="no_usable_body")
     return doc
+
+
+def element_reading_text(element):
+    """The same complete representation is used by packs and quote verification."""
+    value = element["text"]
+    if not isinstance(value, str):
+        raise ValueError("Document element text must be a string")
+    if element["kind"] == "table":
+        value += "\n\nStructured table:\n" + json.dumps(
+            {k: element[k] for k in ("caption", "rows", "footnotes") if k in element}, ensure_ascii=False)
+    if element["kind"] == "formula" and element.get("source_xml"):
+        value += "\n\nSource formula XML:\n" + element["source_xml"]
+    if element.get("resource_references"):
+        value += "\n\nLinked objects (availability is not proof of interpretation):\n" + json.dumps(
+            {k: element[k] for k in ("resource_references", "resource_status", "assets") if k in element}, ensure_ascii=False)
+    return value
+
+
+def element_locator(doc, element, start=0, end=None):
+    """Offsets address element_reading_text, not original PDF/HTML byte offsets."""
+    value = element_reading_text(element)
+    end = len(value) if end is None else end
+    if type(start) is not int or type(end) is not int or not 0 <= start <= end <= len(value):
+        raise ValueError("Invalid element character range")
+    contract = {"parser": doc.get("parser"), "backend": doc.get("backend", {}),
+                "options": doc.get("extraction_options", {}), "continuation": doc.get("continuation", {})}
+    return {"source_sha256": doc["source_sha256"], "parser": doc.get("parser"),
+            "extraction_sha256": hashlib.sha256(json.dumps(contract, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+            "element_id": element["id"], "text_sha256": hashlib.sha256(value.encode()).hexdigest(),
+            "char_start": start, "char_end": end, "offset_basis": "element_reading_text_unicode_codepoints",
+            **{k: element[k] for k in ("page", "bbox", "xml_path", "dom_path", "source_id", "section") if k in element}}
 
 
 def render_document(doc):
     lines = ["# " + doc["article"]["title"], "", "Extraction artifact, not an AI-reading certificate.", ""]
     for element in doc["elements"]:
-        locator = f"page {element['page']}" if "page" in element else element.get("xml_path", "")
-        lines.extend([f"## [{element['id']}] {element['kind']} — {locator}", element["text"], ""])
-        if element.get("rows"):
-            lines.extend([" | ".join(cell["text"] for cell in row) for row in element["rows"]])
-        if element.get("source_xml") and element["kind"] == "formula":
-            lines.extend(["```xml", element["source_xml"], "```", ""])
+        locator = f"page {element['page']}" if "page" in element else element.get("xml_path", element.get("dom_path", ""))
+        lines.extend([f"## [{element['id']}] {element['kind']} — {locator}", element_reading_text(element), ""])
     lines.extend(["## Known gaps", *["- " + str(gap) for gap in doc["gaps"]]])
     return "\n".join(lines) + "\n"

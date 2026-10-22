@@ -162,7 +162,7 @@ class DownloaderTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.pdf_dir = Path(self.tmp.name) / "pdfs"
         self.addCleanup(patch.stopall)
-        patch.object(downloader, "is_public_https_url", return_value=True).start()
+        patch.object(downloader, "is_web_url", return_value=True).start()
         patch.object(downloader.time, "sleep").start()
         # An unexpected network connection is a test failure.
         patch("socket.create_connection", side_effect=AssertionError("Network forbidden")).start()

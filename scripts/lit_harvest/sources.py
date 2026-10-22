@@ -4,14 +4,26 @@ from contextlib import contextmanager
 from datetime import datetime
 import html
 import re
+import shlex
+from difflib import SequenceMatcher
 import threading
 import time
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
 from xml.etree import ElementTree
 
-from .http import HttpClient, HttpError, is_public_https_url
+from .http import HttpClient, HttpError, is_web_url
 from .models import PaperRecord, normalize_doi, normalize_title, normalize_pmcid, normalize_arxiv_id
+from .metered import content_policy as openalex_content_policy
+from .settings import resource_limit
+
+
+def _read_xml_response(response, client):
+    limit = resource_limit(client, "xml_bytes")
+    raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("Provider XML exceeds configured resource budget")
+    return raw
 
 
 PMID_RE = re.compile(r"^(?:pmid:\s*)?(\d{5,9})$", re.I)
@@ -20,7 +32,6 @@ PMCID_RE = re.compile(r"^(?:pmcid:\s*)?(PMC\d+)$", re.I)
 
 # Local run bounds are separate from provider page bounds. OpenAlex's supported
 # maximum is 100 (200 is deprecated); S2 relevance search exposes only 1,000 hits.
-MAX_SEARCH_RESULTS = 10_000
 PAGE_SIZES = {"pubmed": 500, "europe_pmc": 1000, "crossref": 1000,
               "openalex": 100, "semantic_scholar": 100, "arxiv": 1000}
 
@@ -62,15 +73,13 @@ class SearchResults(list):
 
 
 def _search_status(limit: int, source: str) -> dict[str, Any]:
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_SEARCH_RESULTS:
-        raise ValueError(f"limit must be an integer in 1..{MAX_SEARCH_RESULTS}")
-    effective = min(limit, 1000) if source == "semantic_scholar" else limit
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer; the caller owns the configured task budget")
+    effective = limit
     status: dict[str, Any] = {
         "status": "ok", "requested_limit": limit, "effective_limit": effective,
         "pages": 0, "errors": [], "exhausted": False,
     }
-    if effective != limit:
-        status["limit_reason"] = "Semantic Scholar relevance search exposes at most 1000 results"
     return status
 
 
@@ -123,7 +132,7 @@ def _json_pages(
             _page_error(status, exc, len(items), token)
             break
         status["pages"] += 1
-        items.extend(item for item in batch[:cap - len(items)] if isinstance(item, dict))
+        items.extend(batch[:cap - len(items)])
         if not batch:
             status["exhausted"] = True
             break
@@ -155,10 +164,29 @@ def _json_pages(
     return items, status
 
 
+@contextmanager
+def _record_guard(status, rank):
+    """Metadata defects are row failures, not failures of successful HTTP pages."""
+    status["raw_rows"] = status.get("raw_rows", 0) + 1
+    try:
+        yield
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+        errors = status.setdefault("row_errors", [])
+        if len(errors) < 50:
+            errors.append({"row": rank + 1, "error_type": type(exc).__name__})
+        status["row_error_count"] = status.get("row_error_count", 0) + 1
+
+
 def _finish_search(records: list[PaperRecord], status: dict[str, Any]) -> SearchResults:
     for rank, record in enumerate(records):
         record.relevance_score = _score(rank, status["effective_limit"])
     status["count"] = len(records)
+    if "raw_rows" in status:
+        status["parsed_rows"] = len(records)
+        status["skipped_rows"] = status["raw_rows"] - len(records)
+        if status["skipped_rows"]:
+            status["status"] = "partial" if records else "error"
+            status["errors"].append("Metadata rows skipped; see raw_rows, parsed_rows and row_errors")
     return SearchResults(records, status)
 
 
@@ -313,6 +341,63 @@ def _parse_pubmed_xml(raw: bytes, limit: int) -> list[PaperRecord]:
     return records
 
 
+def _pubmed_partitioned_ids(client, term, limit, common, pacer, interval, status):
+    """Split UID ranges without changing the original Boolean search expression.
+
+    Completion is checked against the unpartitioned count, not inferred from
+    successful pages. UID bounds match this adapter's supported PMID syntax.
+    """
+    endpoint = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    ids, seen = [], set()
+    pending = [(1, 999999999)]
+    status["rank_semantics"] = "partitioned_uid_not_global_relevance"
+    def search(expression, offset=0, size=0):
+        with pacer.slot(interval):
+            data = client.get_json(endpoint, {**common, "term": expression, "retmode": "json",
+                                            "retstart": offset, "retmax": size})
+        result = data.get("esearchresult", {})
+        if not str(result.get("count", "")).isdigit() or result.get("errorlist"):
+            raise ValueError("PubMed partition count/query is invalid")
+        status.setdefault("query_trace", []).append({"submitted_query": expression, "retstart": offset,
+            "retmax": size, "count": result["count"], "querytranslation": result.get("querytranslation")})
+        status["pages"] += 1
+        return result
+    try:
+        expected = int(search(term)["count"])
+        status["unpartitioned_count"] = expected
+        while pending and len(ids) < limit:
+            low, high = pending.pop()
+            expression = f"({term}) AND ({low}:{high}[UID])"
+            count = int(search(expression)["count"])
+            if count > 10000:
+                if low == high:
+                    raise ValueError("An indivisible PubMed partition exceeds the provider cap")
+                mid = (low+high)//2
+                pending.extend([(mid+1, high), (low, mid)])
+                continue
+            for offset in range(0, min(count, limit-len(ids)), PAGE_SIZES["pubmed"]):
+                size = min(PAGE_SIZES["pubmed"], count-offset, limit-len(ids))
+                result = search(expression, offset, size)
+                batch = result.get("idlist")
+                if not isinstance(batch, list) or not batch:
+                    raise ValueError("PubMed partition returned fewer identifiers than its count")
+                normalized = [_pmid(v) for v in batch]
+                if any(not v or not low <= int(v) <= high for v in normalized):
+                    raise ValueError("PubMed returned an identifier outside its partition")
+                unique = [v for v in normalized if v not in seen]
+                if not unique:
+                    raise ValueError("PubMed repeated a partition page")
+                seen.update(unique)
+                ids.extend(unique[:limit-len(ids)])
+        status["exhausted"] = not pending and len(ids) == expected
+        status["continuation"] = {"uid_ranges": pending, "collected": len(ids)}
+        if len(ids) < min(expected, limit):
+            raise ValueError("Partition union does not cover the unpartitioned PubMed count")
+    except Exception as exc:
+        _page_error(status, exc, len(ids), {"uid_ranges": pending, "collected": len(ids)})
+    return ids
+
+
 def search_pubmed(
     client: HttpClient, query: str, limit: int, contact_email: str = "", api_key: str = "",
 ) -> list[PaperRecord]:
@@ -331,7 +416,9 @@ def search_pubmed(
     else:
         term = {"doi": f'"{value}"[AID]', "pmcid": f'"{value}"[PMCID]'}.get(kind, value)
         start = 0
-        while len(ids) < limit:
+        if limit > 10000:
+            ids = _pubmed_partitioned_ids(client, term, limit, common, pacer, interval, status)
+        while limit <= 10000 and len(ids) < limit:
             size = min(PAGE_SIZES["pubmed"], limit - len(ids))
             try:
                 with pacer.slot(interval):
@@ -345,6 +432,8 @@ def search_pubmed(
                     "retstart": start, "retmax": size, "submitted_query": term,
                     **{key: result[key] for key in ("querytranslation", "translationstack", "warninglist", "errorlist", "count") if key in result},
                 })
+                if result.get("errorlist") or payload.get("error"):
+                    raise ValueError("PubMed rejected the query; inspect query_trace errorlist")
                 if not isinstance(result.get("idlist"), list):
                     raise ValueError("PubMed returned no idlist")
                 batch = [_pmid(item) for item in result["idlist"] if _pmid(item)]
@@ -371,7 +460,7 @@ def search_pubmed(
         try:
             with pacer.slot(interval):
                 with client.request(url, headers={"Accept": "application/xml"}) as response:
-                    records.extend(_parse_pubmed_xml(response.read(), limit - len(records)))
+                    records.extend(_parse_pubmed_xml(_read_xml_response(response, client), limit - len(records)))
         except Exception as exc:
             _page_error(status, exc, len(records), {"efetch_start": start})
             break
@@ -397,48 +486,49 @@ def search_crossref(client: HttpClient, query: str, limit: int, contact_email: s
         )
     records: list[PaperRecord] = []
     for rank, item in enumerate(items):
-        title_values = item.get("title") or []
-        title = _strip_tags(title_values[0] if title_values else "")
-        if not title:
-            continue
-        authors = []
-        for author in item.get("author") or []:
-            name = " ".join(part for part in (author.get("given", ""), author.get("family", "")) if part)
-            if name:
-                authors.append(name)
-        containers = item.get("container-title") or []
-        licenses = [entry.get("URL", "") for entry in (item.get("license") or []) if entry.get("URL")]
-        license_url = licenses[0] if licenses else ""
-        verified_oa_license = any("creativecommons.org/" in value.lower() for value in licenses)
-        record = PaperRecord(
-            title=title,
-            authors=authors,
-            year=_year_from_parts((item.get("issued") or {}).get("date-parts")),
-            journal=containers[0] if containers else "",
-            abstract=_strip_tags(item.get("abstract")),
-            doi=item.get("DOI", ""),
-            url=item.get("URL", ""),
-            item_type="journalArticle",
-            citation_count=item.get("is-referenced-by-count"),
-            is_oa=True if verified_oa_license else None,
-            license=license_url,
-            sources=["crossref"],
-            relevance_score=_score(rank, limit),
-            extra={
-                "volume": item.get("volume", ""),
-                "issue": item.get("issue", ""),
-                "pages": item.get("page", ""),
-                "publisher": item.get("publisher", ""),
-                "publication_types": _publication_types(item.get("type")),
-            },
-        )
-        if verified_oa_license:
-            for link in item.get("link") or []:
-                if link.get("content-type") == "application/pdf":
-                    record.add_pdf_candidate(
-                        link.get("URL", ""), "crossref_verified_oa", license_url, "publishedVersion"
-                    )
-        records.append(record)
+        with _record_guard(status, rank):
+            title_values = item.get("title") or []
+            title = _strip_tags(title_values[0] if title_values else "")
+            if not title:
+                continue
+            authors = []
+            for author in item.get("author") or []:
+                name = " ".join(part for part in (author.get("given", ""), author.get("family", "")) if part)
+                if name:
+                    authors.append(name)
+            containers = item.get("container-title") or []
+            licenses = [entry.get("URL", "") for entry in (item.get("license") or []) if entry.get("URL")]
+            license_url = licenses[0] if licenses else ""
+            verified_oa_license = any("creativecommons.org/" in value.lower() for value in licenses)
+            record = PaperRecord(
+                title=title,
+                authors=authors,
+                year=_year_from_parts((item.get("issued") or {}).get("date-parts")),
+                journal=containers[0] if containers else "",
+                abstract=_strip_tags(item.get("abstract")),
+                doi=item.get("DOI", ""),
+                url=item.get("URL", ""),
+                item_type="journalArticle",
+                citation_count=item.get("is-referenced-by-count"),
+                is_oa=True if verified_oa_license else None,
+                license=license_url,
+                sources=["crossref"],
+                relevance_score=_score(rank, limit),
+                extra={
+                    "volume": item.get("volume", ""),
+                    "issue": item.get("issue", ""),
+                    "pages": item.get("page", ""),
+                    "publisher": item.get("publisher", ""),
+                    "publication_types": _publication_types(item.get("type")),
+                },
+            )
+            if verified_oa_license:
+                for link in item.get("link") or []:
+                    if link.get("content-type") == "application/pdf":
+                        record.add_pdf_candidate(
+                            link.get("URL", ""), "crossref_verified_oa", license_url, "publishedVersion"
+                        )
+            records.append(record)
     return _finish_search(records, status)
 
 
@@ -457,47 +547,48 @@ def search_europe_pmc(client: HttpClient, query: str, limit: int) -> list[PaperR
     )
     records: list[PaperRecord] = []
     for rank, item in enumerate(items):
-        title = _strip_tags(item.get("title"))
-        if not title:
-            continue
-        authors = []
-        for author in (item.get("authorList") or {}).get("author", []):
-            name = author.get("fullName") or " ".join(
-                part for part in (author.get("firstName", ""), author.get("lastName", "")) if part
-            )
-            if name:
-                authors.append(name)
-        pmcid = normalize_pmcid(item.get("pmcid"))
-        is_oa = str(item.get("isOpenAccess", "")).upper() == "Y"
-        record = PaperRecord(
-            title=title,
-            authors=authors,
-            year=int(item["pubYear"]) if str(item.get("pubYear", "")).isdigit() else None,
-            journal=item.get("journalTitle", ""),
-            abstract=_strip_tags(item.get("abstractText")),
-            doi=item.get("doi", ""),
-            pmid=_pmid(item.get("pmid") or (item.get("id") if item.get("source") == "MED" else "")),
-            pmcid=pmcid,
-            url=f"https://europepmc.org/article/{item.get('source', 'MED')}/{item.get('id', '')}",
-            item_type="preprint" if item.get("source") == "PPR" else "journalArticle",
-            citation_count=int(item["citedByCount"]) if str(item.get("citedByCount", "")).isdigit() else None,
-            is_oa=is_oa,
-            oa_status="open" if is_oa else "closed_or_unknown",
-            license=item.get("license", ""),
-            sources=["europe_pmc"],
-            relevance_score=_score(rank, limit),
-            extra={"publication_types": _publication_types((item.get("pubTypeList") or {}).get("pubType"))},
-        )
-        full_text_urls = (item.get("fullTextUrlList") or {}).get("fullTextUrl", [])
-        for candidate in full_text_urls:
-            if (str(candidate.get("documentStyle", "")).lower() == "pdf"
-                    and (is_oa or str(candidate.get("availability", "")).lower() == "open access")):
-                record.add_pdf_candidate(
-                    candidate.get("url", ""), "europe_pmc", record.license, "publishedVersion"
+        with _record_guard(status, rank):
+            title = _strip_tags(item.get("title"))
+            if not title:
+                continue
+            authors = []
+            for author in (item.get("authorList") or {}).get("author", []):
+                name = author.get("fullName") or " ".join(
+                    part for part in (author.get("firstName", ""), author.get("lastName", "")) if part
                 )
-        if pmcid:
-            _add_pmc_cloud(record)
-        records.append(record)
+                if name:
+                    authors.append(name)
+            pmcid = normalize_pmcid(item.get("pmcid"))
+            is_oa = str(item.get("isOpenAccess", "")).upper() == "Y"
+            record = PaperRecord(
+                title=title,
+                authors=authors,
+                year=int(item["pubYear"]) if str(item.get("pubYear", "")).isdigit() else None,
+                journal=item.get("journalTitle", ""),
+                abstract=_strip_tags(item.get("abstractText")),
+                doi=item.get("doi", ""),
+                pmid=_pmid(item.get("pmid") or (item.get("id") if item.get("source") == "MED" else "")),
+                pmcid=pmcid,
+                url=f"https://europepmc.org/article/{item.get('source', 'MED')}/{item.get('id', '')}",
+                item_type="preprint" if item.get("source") == "PPR" else "journalArticle",
+                citation_count=int(item["citedByCount"]) if str(item.get("citedByCount", "")).isdigit() else None,
+                is_oa=is_oa,
+                oa_status="open" if is_oa else "closed_or_unknown",
+                license=item.get("license", ""),
+                sources=["europe_pmc"],
+                relevance_score=_score(rank, limit),
+                extra={"publication_types": _publication_types((item.get("pubTypeList") or {}).get("pubType"))},
+            )
+            full_text_urls = (item.get("fullTextUrlList") or {}).get("fullTextUrl", [])
+            for candidate in full_text_urls:
+                if (str(candidate.get("documentStyle", "")).lower() == "pdf"
+                        and (is_oa or str(candidate.get("availability", "")).lower() == "open access")):
+                    record.add_pdf_candidate(
+                        candidate.get("url", ""), "europe_pmc", record.license, "publishedVersion"
+                    )
+            if pmcid:
+                _add_pmc_cloud(record)
+            records.append(record)
     return _finish_search(records, status)
 
 
@@ -528,46 +619,17 @@ def _safe_content_urls(value: Any, work_id: str) -> dict[str, str]:
     return result
 
 
-def openalex_content_policy(
-    *, enabled: bool = False, free_only: bool = True, max_files: int = 0,
-    api_key_present: bool = False,
-) -> dict[str, Any]:
-    """Fail closed until the service provides a verified free-only spending guard.
-
-    GET /rate-limit and X-RateLimit-Remaining report usage, not an atomic
-    reservation or a prohibition on charging prepaid funds. A local count cap
-    cannot protect against another process using the same account in between.
-    """
-    if not enabled:
-        return {"status": "disabled", "reason": "OpenAlex content delivery is disabled by default"}
-    if not free_only:
-        return {"status": "blocked", "reason": "Paid content delivery is outside this free-only workflow"}
-    if isinstance(max_files, bool) or not isinstance(max_files, int) or max_files <= 0:
-        return {"status": "blocked", "reason": "OpenAlex content requires an explicit positive max_files cap"}
-    if not api_key_present:
-        return {"status": "blocked", "reason": "OpenAlex content requires an API key"}
-    return {
-        "status": "blocked",
-        "reason": (
-            "OpenAlex content is metered. A verified account free-balance schema and "
-            "server-enforced free-only reservation are unavailable in this adapter; "
-            "a daily allowance or local max_files cap cannot guarantee prepaid funds "
-            "remain untouched. No content request or download candidate was issued."
-        ),
-        "max_files": max_files, "free_only": True,
-        "account_budget_verified": False, "server_spend_guard_verified": False,
-    }
-
-
 def enrich_openalex_content(
     client: HttpClient, records: list[PaperRecord], api_key: str = "", *,
     enabled: bool = False, free_only: bool = True, max_files: int = 0,
+    allow_paid: bool = False, max_cost_usd=0,
 ) -> tuple[int, int, list[str]]:
     """Record per-work eligibility without issuing a potentially metered request."""
     policy = openalex_content_policy(
         enabled=enabled, free_only=free_only, max_files=max_files,
-        api_key_present=bool(api_key),
+        api_key_present=bool(api_key), allow_paid=allow_paid, max_cost_usd=max_cost_usd,
     )
+    enriched = 0
     for record in records:
         has_content = record.extra.get("openalex_has_content") or {}
         urls = _safe_content_urls(record.extra.get("openalex_content_urls"), record.openalex_id)
@@ -580,8 +642,13 @@ def enrich_openalex_content(
             "declared_pdf": isinstance(has_content, dict) and has_content.get("pdf") is True and bool(urls.get("pdf")),
             "license_verified": licensed and record.is_oa is True,
         }
+        eligibility = record.extra["openalex_content"]
+        if policy["status"] == "enabled" and eligibility["declared_pdf"] and eligibility["license_verified"]:
+            record.add_pdf_candidate(urls["pdf"], "openalex_content", license_value, "",
+                                     oa_verified=True, metered=True)
+            enriched += 1
     errors = [policy["reason"]] if policy["status"] == "blocked" else []
-    return 0, 0, errors
+    return enriched, 0, errors
 
 
 def search_openalex(
@@ -610,71 +677,79 @@ def search_openalex(
         items_path=("results",), size_key="per_page", token_key="cursor",
         next_path=("meta", "next_cursor"),
     )
-    records: list[PaperRecord] = []
+    records = []
     for rank, item in enumerate(items):
-        title = item.get("display_name") or item.get("title") or ""
-        if not title:
-            continue
-        authors = [
-            authorship.get("author", {}).get("display_name", "")
-            for authorship in (item.get("authorships") or [])
-            if authorship.get("author", {}).get("display_name")
-        ]
-        best = item.get("best_oa_location") or {}
-        primary = item.get("primary_location") or {}
-        source = primary.get("source") or {}
-        ids = item.get("ids") or {}
-        open_access = item.get("open_access") or {}
-        record = PaperRecord(
-            title=title,
-            authors=authors,
-            year=item.get("publication_year"),
-            journal=source.get("display_name", ""),
-            abstract=_openalex_abstract(item.get("abstract_inverted_index")),
-            doi=ids.get("doi") or item.get("doi") or "",
-            pmid=_pmid(ids.get("pmid")),
-            pmcid=normalize_pmcid(ids.get("pmcid")),
-            openalex_id=_identifier_tail(item.get("id")),
-            url=primary.get("landing_page_url") or item.get("id", ""),
-            item_type="preprint" if item.get("type") == "preprint" else "journalArticle",
-            citation_count=item.get("cited_by_count"),
-            is_oa=open_access.get("is_oa"),
-            oa_status=open_access.get("oa_status", ""),
-            license=best.get("license", ""),
-            sources=["openalex"],
-            relevance_score=_score(rank, limit),
-            extra={
-                "publication_types": _publication_types(item.get("type")),
-                "openalex_has_content": item.get("has_content") or {},
-                "openalex_content_urls": _safe_content_urls(item.get("content_urls"), _identifier_tail(item.get("id"))),
-                "openalex_content_license": best.get("license") or "",
-            },
-        )
-        # A work usually has several OA locations (publisher, PMC, institutional
-        # repository, preprint server). Taking only best_oa_location throws away
-        # every fallback, so one dead link loses the record entirely.
-        seen_locations: list[dict[str, Any]] = []
-        for location in [best, primary, *(item.get("locations") or [])]:
-            if isinstance(location, dict) and location:
-                seen_locations.append(location)
-        for location in seen_locations:
-            if not location.get("is_oa"):
-                continue
-            license_value = location.get("license", "") or ""
-            version = location.get("version", "") or ""
-            pdf_url = location.get("pdf_url", "") or ""
-            if pdf_url:
-                record.add_pdf_candidate(pdf_url, "openalex", license_value, version)
-            landing = location.get("landing_page_url", "") or ""
-            if landing and landing != pdf_url:
-                # No direct file, but the host declared OA. The landing page
-                # usually advertises its own PDF via citation_pdf_url metadata.
-                record.add_pdf_candidate(
-                    landing, "openalex_landing", license_value, version, kind="landing"
-                )
-        _add_pmc_cloud(record)
-        records.append(record)
+        with _record_guard(status, rank):
+            record = openalex_record(item, rank, limit)
+            if record is not None:
+                records.append(record)
     return _finish_search(records, status)
+
+
+def openalex_record(item, rank=0, limit=1):
+    """Shared metadata conversion for search and explicit citation expansion."""
+    title = item.get("display_name") or item.get("title") or ""
+    if not title:
+        return None
+    authors = [
+        authorship.get("author", {}).get("display_name", "")
+        for authorship in (item.get("authorships") or [])
+        if authorship.get("author", {}).get("display_name")
+    ]
+    best = item.get("best_oa_location") or {}
+    primary = item.get("primary_location") or {}
+    source = primary.get("source") or {}
+    ids = item.get("ids") or {}
+    open_access = item.get("open_access") or {}
+    record = PaperRecord(
+        title=title,
+        authors=authors,
+        year=item.get("publication_year"),
+        journal=source.get("display_name", ""),
+        abstract=_openalex_abstract(item.get("abstract_inverted_index")),
+        doi=ids.get("doi") or item.get("doi") or "",
+        pmid=_pmid(ids.get("pmid")),
+        pmcid=normalize_pmcid(ids.get("pmcid")),
+        openalex_id=_identifier_tail(item.get("id")),
+        url=primary.get("landing_page_url") or item.get("id", ""),
+        item_type="preprint" if item.get("type") == "preprint" else "journalArticle",
+        citation_count=item.get("cited_by_count"),
+        is_oa=open_access.get("is_oa"),
+        oa_status=open_access.get("oa_status", ""),
+        license=best.get("license", ""),
+        sources=["openalex"],
+        relevance_score=_score(rank, limit),
+        extra={
+            "publication_types": _publication_types(item.get("type")),
+            "openalex_has_content": item.get("has_content") or {},
+            "openalex_content_urls": _safe_content_urls(item.get("content_urls"), _identifier_tail(item.get("id"))),
+            "openalex_content_license": best.get("license") or "",
+        },
+    )
+    # A work usually has several OA locations (publisher, PMC, institutional
+    # repository, preprint server). Taking only best_oa_location throws away
+    # every fallback, so one dead link loses the record entirely.
+    seen_locations: list[dict[str, Any]] = []
+    for location in [best, primary, *(item.get("locations") or [])]:
+        if isinstance(location, dict) and location:
+            seen_locations.append(location)
+    for location in seen_locations:
+        if not location.get("is_oa"):
+            continue
+        license_value = location.get("license", "") or ""
+        version = location.get("version", "") or ""
+        pdf_url = location.get("pdf_url", "") or ""
+        if pdf_url:
+            record.add_pdf_candidate(pdf_url, "openalex", license_value, version, oa_verified=True)
+        landing = location.get("landing_page_url", "") or ""
+        if landing and landing != pdf_url:
+            # No direct file, but the host declared OA. The landing page
+            # usually advertises its own PDF via citation_pdf_url metadata.
+            record.add_pdf_candidate(
+                landing, "openalex_landing", license_value, version, kind="landing", oa_verified=True
+            )
+    _add_pmc_cloud(record)
+    return record
 
 
 def search_semantic_scholar(
@@ -715,6 +790,32 @@ def search_semantic_scholar(
                 items = []
             else:
                 raise
+    elif limit > 1000:
+        items, used_tokens, token = [], set(), None
+        status["rank_semantics"] = "bulk_unsorted"
+        status["endpoint"] = "paper/search/bulk"
+        while len(items) < limit:
+            try:
+                params = {"query": query, "fields": fields}
+                if token:
+                    params["token"] = token
+                payload = client.get_json("https://api.semanticscholar.org/graph/v1/paper/search/bulk", params, headers)
+                batch = payload.get("data")
+                if not isinstance(batch, list):
+                    raise ValueError("Semantic Scholar bulk returned no result array")
+                items.extend(batch[:limit-len(items)])
+                status["pages"] += 1
+                token = payload.get("token")
+                if not token:
+                    status["exhausted"] = True
+                    break
+                if token in used_tokens:
+                    raise ValueError("Semantic Scholar repeated bulk token")
+                used_tokens.add(token)
+                status["continuation"] = token
+            except Exception as exc:
+                _page_error(status, exc, len(items), token)
+                break
     else:
         items, status = _json_pages(
             client, "https://api.semanticscholar.org/graph/v1/paper/search",
@@ -723,34 +824,38 @@ def search_semantic_scholar(
         )
     records: list[PaperRecord] = []
     for rank, item in enumerate(items):
-        title = item.get("title", "")
-        if not title:
-            continue
-        external = item.get("externalIds") or {}
-        oa_pdf = item.get("openAccessPdf") or {}
-        publication_types = item.get("publicationTypes") or []
-        record = PaperRecord(
-            title=title,
-            authors=[author.get("name", "") for author in (item.get("authors") or []) if author.get("name")],
-            year=item.get("year"),
-            journal=item.get("venue", ""),
-            abstract=item.get("abstract") or "",
-            doi=external.get("DOI", ""),
-            pmid=external.get("PubMed", ""),
-            arxiv_id=external.get("ArXiv", ""),
-            semantic_scholar_id=item.get("paperId", ""),
-            url=item.get("url", ""),
-            item_type="preprint" if "preprint" in _publication_types(publication_types) else "journalArticle",
-            citation_count=item.get("citationCount"),
-            is_oa=True if oa_pdf.get("url") else None,
-            sources=["semantic_scholar"],
-            relevance_score=_score(rank, limit),
-            extra={"publication_types": _publication_types(publication_types)},
-        )
-        record.add_pdf_candidate(
-            oa_pdf.get("url", ""), "semantic_scholar", oa_pdf.get("license", ""), ""
-        )
-        records.append(record)
+        with _record_guard(status, rank):
+            title = item.get("title", "")
+            if not title:
+                continue
+            external = item.get("externalIds") or {}
+            oa_pdf = item.get("openAccessPdf") or {}
+            publication_types = item.get("publicationTypes") or []
+            record = PaperRecord(
+                title=title,
+                authors=[author.get("name", "") for author in (item.get("authors") or []) if author.get("name")],
+                year=item.get("year"),
+                journal=item.get("venue", ""),
+                abstract=item.get("abstract") or "",
+                doi=external.get("DOI", ""),
+                pmid=external.get("PubMed", ""),
+                arxiv_id=external.get("ArXiv", ""),
+                semantic_scholar_id=item.get("paperId", ""),
+                url=item.get("url", ""),
+                item_type="preprint" if "preprint" in _publication_types(publication_types) else "journalArticle",
+                citation_count=item.get("citationCount"),
+                is_oa=True if oa_pdf.get("url") else None,
+                sources=["semantic_scholar"],
+                relevance_score=_score(rank, limit),
+                extra={"publication_types": _publication_types(publication_types)},
+            )
+            record.add_pdf_candidate(
+                oa_pdf.get("url", ""), "semantic_scholar", oa_pdf.get("license", ""), ""
+            )
+            records.append(record)
+    mode = "identifier" if kind in {"doi", "pmid", "arxiv"} else "bulk" if limit > 1000 else "relevance"
+    status.update(effective_mode=mode, submitted_query=query,
+                  rank_semantics="bulk_unsorted" if mode == "bulk" else "identity" if mode == "identifier" else "relevance")
     return _finish_search(records, status)
 
 
@@ -765,14 +870,15 @@ def search_arxiv(client: HttpClient, query: str, limit: int, *, native_query: bo
     while len(entries) < limit:
         size = min(PAGE_SIZES["arxiv"], limit - len(entries))
         params = {"start": start, "max_results": size, "sortBy": "relevance", "sortOrder": "descending"}
-        params["id_list" if kind == "arxiv" else "search_query"] = value if kind == "arxiv" else query if native_query else f'all:"{query}"'
+        params["id_list" if kind == "arxiv" else "search_query"] = value if kind == "arxiv" else query if native_query else " AND ".join(
+            'all:"' + token.replace('"', '').replace('\\', '') + '"' for token in shlex.split(query))
         try:
             with _PROVIDER_PACERS["arxiv"].slot(3.0):
                 with client.request(
                     "https://export.arxiv.org/api/query?" + urlencode(params),
                     headers={"Accept": "application/atom+xml"},
                 ) as response:
-                    root = ElementTree.fromstring(response.read())
+                    root = ElementTree.fromstring(_read_xml_response(response, client))
             batch = root.findall("atom:entry", ns)
             if any(urlparse(entry.findtext("atom:id", "", ns)).hostname in {"arxiv.org", "export.arxiv.org"}
                    and urlparse(entry.findtext("atom:id", "", ns)).path == "/api/errors"
@@ -866,13 +972,13 @@ def enrich_unpaywall(
             version = location.get("version", "") or ""
             pdf_url = location.get("url_for_pdf", "") or ""
             if pdf_url:
-                record.add_pdf_candidate(pdf_url, "unpaywall", license_value, version)
+                record.add_pdf_candidate(pdf_url, "unpaywall", license_value, version, oa_verified=True)
             # Repository records frequently expose only a splash page. Dropping
             # them here was discarding genuinely open full text.
             landing = location.get("url_for_landing_page", "") or location.get("url", "") or ""
             if landing and landing != pdf_url:
                 record.add_pdf_candidate(
-                    landing, "unpaywall_landing", license_value, version, kind="landing"
+                    landing, "unpaywall_landing", license_value, version, kind="landing", oa_verified=True
                 )
         if payload.get("is_oa"):
             record.is_oa = True
@@ -962,7 +1068,8 @@ def enrich_preprint_servers(
 
 
 def _has_direct_pdf(record: PaperRecord) -> bool:
-    return any(candidate.get("kind", "pdf") == "pdf" for candidate in record.pdf_candidates)
+    # Discovery of a URL is not proof that a usable PDF exists.
+    return record.download_status in {"downloaded", "already_downloaded"} and record.identity_status == "verified"
 
 
 def _author_match_tokens(values: list[str]) -> set[str]:
@@ -1013,28 +1120,26 @@ def enrich_preprints_by_title(
     evidence is accepted -- a title alone can silently attach the wrong
     manuscript or conference abstract.
     """
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
-        raise ValueError("preprint title limit must be an integer in 1..1000")
+    if type(limit) is not int or limit < 1:
+        raise ValueError("preprint title limit must be a positive integer")
     enriched = 0
     attempted = 0
     errors: list[str] = []
     for record in records:
         if (not force and _has_direct_pdf(record)) or record.item_type == "preprint":
             continue
-        if len(record.normalized_title) < 20:
+        if not record.normalized_title:
             continue
         attempted += 1
         safe_title = record.title.replace('"', " ").replace("\\", " ").strip()
         try:
-            payload = client.get_json(
+            items, search_status = _json_pages(client,
                 "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
-                {
-                    "query": f'TITLE:"{safe_title}" AND SRC:PPR',
-                    "format": "json",
-                    "pageSize": limit,
-                    "resultType": "core",
-                },
-            )
+                {"query": f'TITLE:"{safe_title}" AND SRC:PPR', "format": "json", "resultType": "core"},
+                limit, "europe_pmc", items_path=("resultList", "result"), size_key="pageSize",
+                token_key="cursorMark", next_path=("nextCursorMark",))
+            record.extra["preprint_search"] = search_status
+            errors.extend(search_status["errors"])
         except HttpError as exc:
             errors.append(f"{record.doi or record.title[:60]}: {exc}"[:500])
             continue
@@ -1043,9 +1148,17 @@ def enrich_preprints_by_title(
             continue
 
         found = False
-        for item in payload.get("resultList", {}).get("result", []):
+        for item in items:
             if not _preprint_metadata_matches(record, item):
+                similarity = SequenceMatcher(None, record.normalized_title,
+                    normalize_title(_strip_tags(item.get("title"))), autojunk=False).ratio()
+                if similarity >= 0.75:
+                    record.extra.setdefault("preprint_review_candidates", []).append({
+                        "title": item.get("title", ""), "doi": normalize_doi(item.get("doi", "")),
+                        "source_id": item.get("id", ""), "title_similarity": round(similarity, 4),
+                        "decision": "uncertain", "reason": "Related title is not verified version identity"})
                 continue
+            item_found = False
             license_value = str(item.get("license", "") or "")
             for candidate in (item.get("fullTextUrlList") or {}).get("fullTextUrl", []):
                 if str(candidate.get("documentStyle", "")).lower() == "pdf":
@@ -1055,9 +1168,9 @@ def enrich_preprints_by_title(
                         license_value,
                         "submittedVersion",
                     )
-                    found = True
+                    item_found = True
             preprint_doi = normalize_doi(item.get("doi", ""))
-            if preprint_doi and not found:
+            if preprint_doi and not item_found:
                 resolved = None
                 resolution_errors: list[str] = []
                 if preprint_doi.startswith("10.1101/"):
@@ -1086,22 +1199,26 @@ def enrich_preprints_by_title(
                         "submittedVersion",
                         kind="landing",
                     )
+                item_found = True
+            if item_found:
                 found = True
-            if found:
+                if preprint_doi:
+                    relations = record.extra.setdefault("approved_preprint_dois", [])
+                    if preprint_doi not in relations:
+                        relations.append(preprint_doi)
                 record.extra["preprint_doi"] = preprint_doi or item.get("id", "")
                 record.extra["version_relation_confidence"] = "high"
                 record.extra["version_relation_basis"] = "exact_title_author_year"
                 record.sources = list(dict.fromkeys(record.sources + ["europe_pmc_preprint"]))
                 if record.is_oa is None:
                     record.oa_status = record.oa_status or "green"
-                break
         if found:
             enriched += 1
     return enriched, attempted, errors
 
 
 def _is_oa_landing(url: str) -> bool:
-    return bool(is_public_https_url(url))
+    return bool(is_web_url(url))
 
 
 def _pdf_urls_in_structure(value: Any, base: str = "") -> list[str]:
@@ -1122,14 +1239,14 @@ def _pdf_urls_in_structure(value: Any, base: str = "") -> list[str]:
                     if ".pdf" in lowered and (
                         "url" in key.casefold() or "link" in key.casefold() or ".pdf" in lowered
                     ):
-                        if is_public_https_url(child):
+                        if is_web_url(child):
                             found.append(child)
                 else:
                     walk(child)
         elif isinstance(node, list):
             for child in node:
                 if isinstance(child, str):
-                    if ".pdf" in child.casefold() and is_public_https_url(child):
+                    if ".pdf" in child.casefold() and is_web_url(child):
                         found.append(child)
                 else:
                     walk(child)
@@ -1138,8 +1255,23 @@ def _pdf_urls_in_structure(value: Any, base: str = "") -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _same_publication(record, *, doi="", title="", year=None, authors=()):
+    observed = normalize_doi(doi)
+    if record.doi and observed:
+        return observed == record.doi
+    if normalize_title(title) != record.normalized_title or not record.normalized_title:
+        return False
+    try:
+        year_match = record.year is not None and int(str(year)[:4]) == record.year
+    except (ValueError, TypeError):
+        year_match = False
+    names = [str(a.get("name") or a.get("fullName") or "") if isinstance(a, dict) else str(a) for a in authors]
+    return year_match and bool(_author_match_tokens(names) & _author_match_tokens(record.authors))
+
+
 def enrich_core(
     client: HttpClient, records: list[PaperRecord], api_key: str, force: bool = False,
+    limit: int = 50,
 ) -> tuple[int, int, list[str]]:
     """Resolve open repository copies through CORE (api.core.ac.uk/v3)."""
     if not api_key:
@@ -1148,35 +1280,42 @@ def enrich_core(
     attempted = 0
     errors: list[str] = []
     for record in records:
-        if (not force and _has_direct_pdf(record)) or not record.doi:
+        if (not force and _has_direct_pdf(record)) or not (record.doi or record.title):
             continue
         attempted += 1
         try:
-            payload = client.get_json(
-                "https://api.core.ac.uk/v3/search/works",
-                {
-                    "q": f"doi:\"{record.doi}\"",
-                    "limit": 5,
-                    "scroll": "false",
-                    "stats": "false",
-                    "exclude": "fullText",
-                },
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
+            items, offset = [], 0
+            while len(items) < limit:
+                size = min(50, limit-len(items))
+                safe_title = record.title.replace('"', ' ').replace('\\', ' ')
+                payload = client.get_json("https://api.core.ac.uk/v3/search/works", {
+                    "q": f'doi:"{record.doi}"' if record.doi else f'title:"{safe_title}"',
+                    "limit": size, "offset": offset, "scroll": "false", "stats": "false", "exclude": "fullText"},
+                    headers={"Authorization": f"Bearer {api_key}"})
+                batch = payload.get("results")
+                if not isinstance(batch, list):
+                    raise ValueError("CORE returned no result array")
+                items.extend(batch[:limit-len(items)])
+                offset += len(batch)
+                if len(batch) < size or offset >= int(payload.get("totalHits", limit)):
+                    break
+            record.extra["core_search"] = {"considered": len(items), "next_offset": offset,
+                                          "budget_reached": len(items) == limit}
         except HttpError as exc:
             errors.append(f"{record.doi}: {exc}"[:500])
-            continue
+            record.extra["core_search"] = {"considered": len(items), "next_offset": offset, "partial": True}
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{record.doi}: {exc}"[:500])
-            continue
+            record.extra["core_search"] = {"considered": len(items), "next_offset": offset, "partial": True}
         before = len(record.pdf_candidates)
-        for item in payload.get("results") or []:
-            if not isinstance(item, dict) or normalize_doi(item.get("doi", "")) != record.doi:
+        for item in items:
+            if not isinstance(item, dict) or not _same_publication(record, doi=item.get("doi", ""),
+                    title=item.get("title", ""), year=item.get("yearPublished"), authors=item.get("authors") or []):
                 continue
             license_value = str(item.get("license") or "")
             pdf_url = str(item.get("downloadUrl") or "")
-            if is_public_https_url(pdf_url):
-                record.add_pdf_candidate(pdf_url, "core", license_value, "repositoryVersion")
+            if is_web_url(pdf_url):
+                record.add_pdf_candidate(pdf_url, "core", license_value, "repositoryVersion", oa_verified=True)
             source_urls = item.get("sourceFulltextUrls") or []
             if isinstance(source_urls, str):
                 source_urls = [source_urls]
@@ -1184,9 +1323,9 @@ def enrich_core(
                 url = str(url or "")
                 if url == pdf_url:
                     continue
-                if is_public_https_url(url):
+                if is_web_url(url):
                     record.add_pdf_candidate(
-                        url, "core_landing", license_value, "repositoryVersion", kind="landing"
+                        url, "core_landing", license_value, "repositoryVersion", kind="landing", oa_verified=True
                     )
         if len(record.pdf_candidates) > before:
             enriched += 1
@@ -1195,18 +1334,19 @@ def enrich_core(
 
 
 def enrich_openaire(client: HttpClient, records: list[PaperRecord]) -> tuple[int, int, list[str]]:
-    """Resolve European repository copies through OpenAIRE."""
+    """Use Graph v3, checking identity and each individual instance's access."""
     enriched = 0
     attempted = 0
     errors: list[str] = []
     for record in records:
-        if _has_direct_pdf(record) or not record.doi:
+        if _has_direct_pdf(record) or not (record.doi or record.title):
             continue
         attempted += 1
         try:
             payload = client.get_json(
-                "https://api.openaire.eu/search/publications",
-                {"doi": record.doi, "format": "json"},
+                "https://api.openaire.eu/graph/v3/research-products",
+                {"pid" if record.doi else "mainTitle": record.doi or record.title,
+                 "type": "publication", "pageSize": 25},
             )
         except HttpError as exc:
             errors.append(f"{record.doi}: {exc}"[:500])
@@ -1215,10 +1355,25 @@ def enrich_openaire(client: HttpClient, records: list[PaperRecord]) -> tuple[int
             errors.append(f"{record.doi}: {exc}"[:500])
             continue
         found = False
-        for url in _pdf_urls_in_structure(payload):
-            if url:
-                record.add_pdf_candidate(url, "openaire", "", "acceptedVersion")
-                found = True
+        for item in payload.get("results") or []:
+            dois = [p.get("value", "") for p in item.get("pids", []) if p.get("scheme", "").lower() == "doi"]
+            if record.doi and dois and record.doi not in {normalize_doi(d) for d in dois}:
+                continue
+            if not _same_publication(record, doi=record.doi if record.doi in {normalize_doi(d) for d in dois} else "",
+                    title=item.get("mainTitle", ""), year=item.get("publicationDate"), authors=item.get("authors") or []):
+                continue
+            for instance in item.get("instances") or []:
+                access = instance.get("accessRight") or {}
+                if access.get("code") != "c_abf2" and access.get("label") != "OPEN":
+                    continue
+                for url in instance.get("urls") or []:
+                    if not is_web_url(url):
+                        continue
+                    kind = "pdf" if urlparse(url).path.lower().endswith(".pdf") else "landing"
+                    record.add_pdf_candidate(url, "openaire" if kind == "pdf" else "openaire_landing",
+                        instance.get("license", ""), "repositoryVersion", kind=kind, oa_verified=True,
+                        access_evidence="OpenAIRE instance accessRight OPEN")
+                    found = True
         if found:
             enriched += 1
             record.sources = list(dict.fromkeys(record.sources + ["openaire"]))
@@ -1231,12 +1386,13 @@ def enrich_doaj(client: HttpClient, records: list[PaperRecord]) -> tuple[int, in
     attempted = 0
     errors: list[str] = []
     for record in records:
-        if _has_direct_pdf(record) or not record.doi:
+        if _has_direct_pdf(record) or not (record.doi or record.title):
             continue
         attempted += 1
         try:
             payload = client.get_json(
-                "https://doaj.org/api/search/articles/doi:" + quote(record.doi, safe="")
+                "https://doaj.org/api/search/articles/" + quote(
+                    'doi:"' + record.doi + '"' if record.doi else 'bibjson.title:"' + record.title.replace('"', ' ') + '"', safe="")
             )
         except HttpError as exc:
             errors.append(f"{record.doi}: {exc}"[:500])
@@ -1247,15 +1403,21 @@ def enrich_doaj(client: HttpClient, records: list[PaperRecord]) -> tuple[int, in
         found = False
         for item in payload.get("results") or []:
             bibjson = item.get("bibjson") or {}
+            dois = [p.get("id", "") for p in bibjson.get("identifier", []) if p.get("type") == "doi"]
+            if record.doi and dois and record.doi not in {normalize_doi(d) for d in dois}:
+                continue
+            if not _same_publication(record, doi=record.doi if record.doi in {normalize_doi(d) for d in dois} else "",
+                    title=bibjson.get("title", ""), year=bibjson.get("year"), authors=bibjson.get("author") or []):
+                continue
             for link in bibjson.get("link") or []:
                 url = str(link.get("url", "") or "")
-                if not is_public_https_url(url):
+                if not is_web_url(url):
                     continue
-                if ".pdf" in url.casefold():
-                    record.add_pdf_candidate(url, "doaj", "", "publishedVersion")
+                if link.get("content_type") == "application/pdf" or urlparse(url).path.lower().endswith(".pdf"):
+                    record.add_pdf_candidate(url, "doaj", "", "publishedVersion", oa_verified=True)
                     found = True
                 else:
-                    record.add_pdf_candidate(url, "doaj_landing", "", "publishedVersion", kind="landing")
+                    record.add_pdf_candidate(url, "doaj_landing", "", "publishedVersion", kind="landing", oa_verified=True)
                     found = True
         if found:
             enriched += 1

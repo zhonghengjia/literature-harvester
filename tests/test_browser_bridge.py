@@ -103,10 +103,10 @@ class BrowserHandoffTests(unittest.TestCase):
         self.assertIn("user_attested", result["access_evidence"]["verification_level"])
         self.assertFalse(list(self.pdf_dir.glob("*.part")))
 
-    def test_title_only_record_is_held_before_copy(self):
+    def test_no_identifier_record_still_requires_pdf_identity(self):
         result = self.ingest(record=paper(doi=""))
         self.assertEqual(result["outcome"], "manual_review")
-        self.assertFalse(self.pdf_dir.exists())
+        self.assertFalse(list(self.pdf_dir.glob("*.pdf")))
 
     def test_bare_oa_label_and_record_is_oa_do_not_establish_access(self):
         self.record.is_oa = True
@@ -134,10 +134,8 @@ class BrowserHandoffTests(unittest.TestCase):
         self.assertEqual(self.ingest(url="https://new-mirror.example/file.pdf",
                                     evidence=basis(confirmed_by="plugin_verified"))["outcome"], "manual_review")
 
-    def test_credential_local_and_non_https_urls_are_held(self):
-        for url in ["https://user:secret@publisher.example/file.pdf", "http://publisher.example/file.pdf",
-                    "https://127.0.0.1/file", "https://localhost/file", "file:///tmp/a.pdf",
-                    "https://publisher.example:7777/file"]:
+    def test_invalid_url_and_embedded_credentials_are_held(self):
+        for url in ["https://user:secret@publisher.example/file.pdf", "file:///tmp/a.pdf"]:
             self.assertEqual(self.ingest(url=url)["outcome"], "manual_review")
         self.assertNotIn("secret", json.dumps(self.record.attempts))
 
@@ -163,9 +161,10 @@ class BrowserHandoffTests(unittest.TestCase):
     def test_missing_pdf_and_oversize_pdf_fail_before_copy(self):
         self.source.unlink()
         self.assertEqual(self.ingest()["outcome"], "download_failed")
-        self.source.write_bytes(pdf_bytes())
-        with patch.object(browser, "MAX_LOCAL_BYTES", 10):
-            self.assertEqual(self.ingest()["outcome"], "too_large")
+        self.source.write_bytes(pdf_bytes() + b" " * (1024*1024))
+        result = browser.ingest_local_pdf(self.record, self.source, self.pdf_dir, SOURCE,
+                                         basis(), [self.record], max_pdf_mb=1)
+        self.assertEqual(result["outcome"], "too_large")
         self.assertFalse(self.pdf_dir.exists())
 
     def test_existing_destination_not_overwritten(self):

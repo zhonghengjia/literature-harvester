@@ -14,21 +14,14 @@ from .downloader import SOURCE_PRIORITY, download_record, mark_duplicate
 from .http import HttpClient, host_deferrals, restore_host_deferrals
 from .models import PaperRecord, normalize_title, candidate_request_key
 from .query_plan import validate_plan, candidate_id, concept_evidence, SelectedRecords
+from .query_lint import inspect_query
+from .settings import DEFAULT_CONFIG, make_client, section, positive, effective_settings, validate_config
+from .metered import bind_budget
 from .outcomes import ARTICLE_TYPES, collect_population, article_type, is_verified_pdf, summarize_outcomes
 from .sources import (SOURCE_FUNCTIONS, enrich_core, enrich_doaj, enrich_openaire,
                       enrich_preprint_servers, enrich_preprints_by_title, enrich_unpaywall,
                       enrich_openalex_content, openalex_content_policy)
 
-DEFAULT_CONFIG = {
-    "general": {"output_root": "~/Documents/Literature", "max_results": 25,
-                "max_candidates": 500, "max_pdf_mb": 100, "request_timeout_seconds": 30, "contact_email": ""},
-    "sources": {"pubmed": True, "crossref": True, "europe_pmc": True, "openalex": True,
-                "semantic_scholar": True, "arxiv": True, "unpaywall": True, "biorxiv_medrxiv": True,
-                "preprint_title_match": True, "core": True, "openaire": False, "doaj": False},
-    "openalex_content": {"enabled": False, "free_only": True, "max_files": 0},
-    "zotero": {"base_url": "http://127.0.0.1:23119/api", "collection": "",
-               "attachment_mode": "imported_file"},
-}
 METADATA_SOURCE_PRIORITY = {"pubmed": 0, "europe_pmc": 1, "crossref": 2, "openalex": 3, "semantic_scholar": 4, "arxiv": 5}
 
 def _deep_merge(base, override):
@@ -38,10 +31,13 @@ def _deep_merge(base, override):
     return result
 
 def load_config(path=None):
+    path = path or os.environ.get("LITERATURE_HARVESTER_CONFIG")
     if not path:
-        return _deep_merge(DEFAULT_CONFIG, {})
+        return validate_config(_deep_merge(DEFAULT_CONFIG, {}))
     with Path(path).expanduser().open("rb") as handle:
-        return _deep_merge(DEFAULT_CONFIG, tomllib.load(handle))
+        config = _deep_merge(DEFAULT_CONFIG, tomllib.load(handle))
+    config["_configuration_source"] = str(Path(path).expanduser().resolve())
+    return validate_config(config)
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -78,6 +74,20 @@ def _merge_candidate(existing, incoming):
     for field in ("doi", "pmid", "pmcid", "arxiv_id"):
         if getattr(existing, field) and getattr(incoming, field) and getattr(existing, field) != getattr(incoming, field):
             return False
+    shared_ids = (set(existing.identity_keys) & set(incoming.identity_keys)) - {f"title:{existing.normalized_title}"}
+    if not shared_ids:
+        # Title-only matches are suggestions when other metadata contradicts.
+        for prefix in ("openalex:", "semantic_scholar:"):
+            left = {k for k in existing.identity_keys if k.startswith(prefix)}
+            right = {k for k in incoming.identity_keys if k.startswith(prefix)}
+            if left and right and not left & right:
+                return False
+        if existing.year and incoming.year and existing.year != incoming.year:
+            return False
+        left = {normalize_title(a) for a in existing.authors}
+        right = {normalize_title(a) for a in incoming.authors}
+        if left and right and not left & right:
+            return False
     existing.merge(incoming)
     return True
 
@@ -105,7 +115,10 @@ def merge_records(records, limit=None, *, ranking="legacy"):
             ranks = {}
             for hit in record.extra.get("discovery_hits", []):
                 key = hit["route_id"]
-                ranks[key] = min(ranks.get(key, hit["rank"]), hit["rank"])
+                # Bulk providers supply ID/date order, not relevance. Their hits
+                # contribute equal discovery evidence, never fabricated ranking.
+                rank = hit["rank"] if hit.get("rank_semantics", "relevance") == "relevance" else 1
+                ranks[key] = min(ranks.get(key, rank), rank)
             record.relevance_score = sum(1.0 / (60 + rank) for rank in ranks.values())
         else:
             base = float(record.extra.setdefault("base_relevance_score", record.relevance_score))
@@ -122,7 +135,7 @@ def filter_required_terms(records, terms):
 
 def _search_one(source, query, limit, config, env, *, native_query=False):
     contact = effective_contact_email(config, env)
-    client = HttpClient(timeout=int(config["general"]["request_timeout_seconds"]))
+    client = make_client(config)
     args = [client, query, limit]
     if source == "pubmed":
         args += [contact, env.get("NCBI_API_KEY", "")]
@@ -137,13 +150,14 @@ def _search_one(source, query, limit, config, env, *, native_query=False):
     return SOURCE_FUNCTIONS[source](*args)
 
 def enrich_records(records, config, env, *, force=False):
-    client = HttpClient(timeout=int(config["general"]["request_timeout_seconds"]))
+    client = make_client(config)
+    budgets = section(config, "search")
     email = env.get("UNPAYWALL_EMAIL") or effective_contact_email(config, env)
     jobs = {
         "biorxiv_medrxiv": (enrich_preprint_servers, (), {}),
         "unpaywall": (enrich_unpaywall, (email,), {}),
-        "preprint_title_match": (enrich_preprints_by_title, (), {"force": force}),
-        "core": (enrich_core, (env.get("CORE_API_KEY", ""),), {"force": force}),
+        "preprint_title_match": (enrich_preprints_by_title, (), {"force": force, "limit": budgets["preprint_candidates"]}),
+        "core": (enrich_core, (env.get("CORE_API_KEY", ""),), {"force": force, "limit": budgets["core_candidates"]}),
         "openaire": (enrich_openaire, (), {}), "doaj": (enrich_doaj, (), {}),
     }
     statuses = {}
@@ -168,8 +182,8 @@ def search_all(query, config, max_results, env=None, *, required_terms=None, art
     env = dict(os.environ) if env is None else env
     enabled = [s for s in SOURCE_FUNCTIONS if config["sources"].get(s, False)]
     all_records, statuses = [], {}
-    source_limit = max_candidates or max_results
-    plan = validate_plan(query_plan) if query_plan is not None else None
+    source_limit = max_candidates or max(max_results, int(config["general"]["max_candidates"]))
+    plan = validate_plan(query_plan, section(config, "plan_limits")) if query_plan is not None else None
     routes = plan["routes"] if plan else [{"id": s, "source": s, "query": query, "limit": source_limit, "syntax": "text"} for s in enabled]
     active = []
     for route in routes:
@@ -177,7 +191,7 @@ def search_all(query, config, max_results, env=None, *, required_terms=None, art
             statuses[route["id"]] = {"status": "disabled", "count": 0, **route}
         else:
             active.append(route)
-    with ThreadPoolExecutor(max_workers=min(len(enabled), 5) or 1) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(enabled), positive(section(config, "search")["workers"], "workers")) or 1) as executor:
         futures = {}
         for route in active:
             args = (route["source"], route["query"], route["limit"], config, env)
@@ -188,10 +202,10 @@ def search_all(query, config, max_results, env=None, *, required_terms=None, art
             source = route["id"]
             try:
                 found = future.result()
-                if plan:
-                    for rank, record in enumerate(found, 1):
-                        record.extra.setdefault("discovery_hits", []).append({"route_id": source,
-                            "source": route["source"], "rank": rank, "source_ids": record.identity_keys})
+                for rank, record in enumerate(found, 1):
+                    record.extra.setdefault("discovery_hits", []).append({"route_id": source,
+                        "source": route["source"], "rank": rank, "source_ids": record.identity_keys,
+                        "rank_semantics": getattr(found, "source_status", {}).get("rank_semantics", "relevance")})
                 all_records.extend(found)
                 statuses[source] = {"status": "ok", "count": len(found), **getattr(found, "source_status", {})}
             except Exception as exc:
@@ -200,26 +214,27 @@ def search_all(query, config, max_results, env=None, *, required_terms=None, art
                     statuses[source]["retry_at"] = exc.retry_at
             if plan:
                 statuses[source].update({"route": route, "observed_at": utc_now()})
+            statuses[source]["query_diagnostics"] = inspect_query(route["query"], route["source"], route["syntax"])
     route_order = {r["id"]: index for index, r in enumerate(routes)}
     all_records.sort(key=lambda r: (min((METADATA_SOURCE_PRIORITY.get(s, 99) for s in r.sources), default=99),
         min((route_order[h["route_id"]] for h in r.extra.get("discovery_hits", [])), default=0) if plan else 0))
-    merged = merge_records(all_records, ranking="routes" if plan else "legacy")
+    merged = merge_records(all_records, ranking="routes")
     eligible = filter_required_terms(merged, required_terms)
     if article_types:
         if set(article_types) - ARTICLE_TYPES:
             raise ValueError("Unsupported article type filter")
-        eligible = [r for r in eligible if article_type(r) in article_types]
+        eligible = [r for r in eligible if article_type(r) in article_types or article_type(r) == "unknown"]
+        eligible.sort(key=lambda r: article_type(r) == "unknown")
     records = eligible[:max_results]
-    if plan:
-        eligible_ids = {id(r) for r in eligible}
-        for record in merged:
-            record.extra["candidate_id"] = candidate_id(record)
-            record.extra["concept_evidence"] = concept_evidence(record, plan["concepts"])
-            record.extra["screening"] = {"decision": "uncertain", "reason": "Not yet reviewed against the research question", "actor": "system", "at": utc_now()}
-            record.extra["queue_eligible"] = id(record) in eligible_ids
-            if id(record) not in eligible_ids:
-                record.extra["queue_exclusion_reason"] = "Explicit requested metadata/literal filter; candidate retained"
-        records = SelectedRecords(records, merged)
+    eligible_ids = {id(r) for r in eligible}
+    for record in merged:
+        record.extra["candidate_id"] = candidate_id(record)
+        record.extra["concept_evidence"] = concept_evidence(record, plan["concepts"] if plan else [])
+        record.extra["screening"] = {"decision": "uncertain", "reason": "Not yet reviewed against the research question", "actor": "system", "at": utc_now()}
+        record.extra["queue_eligible"] = id(record) in eligible_ids
+        if id(record) not in eligible_ids:
+            record.extra["queue_exclusion_reason"] = "Explicit requested metadata/literal filter; candidate retained"
+    records = SelectedRecords(records, merged)
     statuses["selection"] = {"raw_records": len(all_records), "deduplicated_records": len(merged),
         "eligible_records": len(eligible), "selected_records": len(records), "source_candidate_limit": source_limit,
         "excluded_by_filters": len(merged)-len(eligible), "outside_selected_cap": max(0, len(eligible)-max_results)}
@@ -227,13 +242,15 @@ def search_all(query, config, max_results, env=None, *, required_terms=None, art
         statuses["selection"]["source_candidate_limit"] = None
         statuses["selection"]["route_candidate_limits"] = {r["id"]: r["limit"] for r in routes}
     content = config.get("openalex_content", {})
-    client = HttpClient(timeout=int(config["general"]["request_timeout_seconds"]))
+    client = make_client(config)
     result = enrich_openalex_content(client, records, env.get("OPENALEX_API_KEY", ""),
         enabled=bool(content.get("enabled", False)), free_only=bool(content.get("free_only", True)),
-        max_files=int(content.get("max_files", 0)))
+        max_files=int(content.get("max_files", 0)), allow_paid=bool(content.get("allow_paid", False)),
+        max_cost_usd=content.get("max_cost_usd", 0))
     statuses["openalex_content"] = {**openalex_content_policy(
         enabled=bool(content.get("enabled", False)), free_only=bool(content.get("free_only", True)),
-        max_files=int(content.get("max_files", 0)), api_key_present=bool(env.get("OPENALEX_API_KEY"))),
+        max_files=int(content.get("max_files", 0)), api_key_present=bool(env.get("OPENALEX_API_KEY")),
+        allow_paid=bool(content.get("allow_paid", False)), max_cost_usd=content.get("max_cost_usd", 0)),
         "count": result[0], "attempted": result[1], "errors": result[2]}
     return records, _redact(statuses, config, env)
 
@@ -312,7 +329,7 @@ def retrieve_population(run_dir, manifest, records, config, env):
             try:
                 download_record(record, run_dir/"pdfs", int(config["general"]["max_pdf_mb"]),
                     int(config["general"]["request_timeout_seconds"]), contact_email=contact,
-                    allow_fulltext_fallback=False)
+                    allow_fulltext_fallback=False, config=config)
             finally:
                 record.pdf_candidates = candidates
             mark_duplicate(record, seen_hashes)
@@ -326,7 +343,7 @@ def retrieve_population(run_dir, manifest, records, config, env):
             continue
         try:
             download_record(record, run_dir/"pdfs", int(config["general"]["max_pdf_mb"]),
-                int(config["general"]["request_timeout_seconds"]), contact_email=contact, allow_fulltext_fallback=False)
+                int(config["general"]["request_timeout_seconds"]), contact_email=contact, allow_fulltext_fallback=False, config=config)
             checkpoint()
             if not is_verified_pdf(record):
                 primary_status, primary_reason = record.download_status, record.failure_reason
@@ -338,7 +355,7 @@ def retrieve_population(run_dir, manifest, records, config, env):
                                          or c.get("kind") in {"jats", "fulltext_xml"}]
                 try:
                     download_record(record, run_dir/"pdfs", int(config["general"]["max_pdf_mb"]),
-                        int(config["general"]["request_timeout_seconds"]), contact_email=contact, allow_fulltext_fallback=True)
+                        int(config["general"]["request_timeout_seconds"]), contact_email=contact, allow_fulltext_fallback=True, config=config)
                 finally:
                     new_candidates = list(record.pdf_candidates)
                     record.pdf_candidates = all_candidates
@@ -358,25 +375,32 @@ def retrieve_population(run_dir, manifest, records, config, env):
 
 def run_pipeline(query, config, max_results, output_dir, download, target_pdfs=None,
                  required_terms=None, env=None, *, article_types=None, max_candidates=None, query_plan=None):
-    if not 1 <= max_results <= 10000 or (max_candidates is not None and not max_results <= max_candidates <= 10000):
-        raise ValueError("Candidate limits must satisfy 1 <= max_results <= max_candidates <= 10000")
+    cap = positive(section(config, "search")["max_records"], "search.max_records")
+    if not 1 <= max_results <= cap or (max_candidates is not None and not max_results <= max_candidates <= cap):
+        raise ValueError(f"Candidate limits must satisfy 1 <= max_results <= max_candidates <= {cap}")
     if target_pdfs is not None and (not download or not 1 <= target_pdfs <= max_results):
         raise ValueError("PDF target must be within the selected candidate cap and require downloading")
-    plan = validate_plan(query_plan) if query_plan is not None else None
+    plan = validate_plan(query_plan, section(config, "plan_limits")) if query_plan is not None else None
     if plan:
         query = plan["question"]
     env = dict(os.environ) if env is None else env
     run_dir = create_run_dir(query, config, output_dir)
+    config = bind_budget(config, env, run_dir)
     search_options = {"required_terms": required_terms, "article_types": article_types, "max_candidates": max_candidates}
     if plan:
         search_options["query_plan"] = plan
     records, statuses = search_all(query, config, max_results, env, **search_options)
-    settings = {"max_results": max_results, "max_candidates": max_candidates or max_results,
+    settings = {"max_results": max_results, "max_candidates": max_candidates or max(max_results, int(config["general"]["max_candidates"])),
         "download": download, "target_pdfs": target_pdfs, "required_terms": required_terms or [],
         "article_types": article_types or [], "enabled_sources": [k for k, v in config["sources"].items() if v],
-        "output_dir": str(run_dir)}
+        "output_dir": str(run_dir), "effective_config": effective_settings(config)}
     manifest = new_manifest(query, records, statuses, settings)
-    if plan:
+    if isinstance(records, SelectedRecords):
+        if plan is None:
+            plan = {"schema_version": 1, "question": query, "concepts": [], "routes": [
+                {"id": source, "source": source, "query": query, "syntax": "text",
+                 "limit": max_candidates or max(max_results, int(config["general"]["max_candidates"]))}
+                for source in SOURCE_FUNCTIONS if config["sources"].get(source, False)]}
         context = {"schema_version": 1, "ranking": "RRF k=60, one-based source rank; citation count excluded",
                    "selected_candidate_ids": [r.extra["candidate_id"] for r in records]}
         for name, value in (("query-plan.json", plan), ("candidates.json", {"schema_version": 1, "records": [r.to_dict() for r in records.candidates]})):
@@ -394,6 +418,8 @@ def resume_pipeline(manifest_path, config, output_dir=None, env=None):
     source_path = Path(manifest_path).expanduser().resolve()
     previous, records = load_manifest(source_path)
     run_dir = create_run_dir(str(previous.get("query", "resume")), config, output_dir)
+    env = dict(os.environ) if env is None else env
+    config = bind_budget(config, env, run_dir)
     manifest = new_manifest(str(previous.get("query", "")), records, previous.get("source_status", {}),
         {**previous.get("settings", {}), "output_dir": str(run_dir), "download": True,
          "enabled_sources": [key for key, enabled in config["sources"].items() if enabled]})

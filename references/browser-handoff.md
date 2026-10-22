@@ -15,7 +15,7 @@ manifest's source assertion; the user must verify the original provider before
 using the PDF. No URL is opened and no browser setting changes.
 
 `browser-ingest` requires one exact namespaced record ID such as
-`doi:10.1234/example`, an explicitly selected local PDF, the original source URL,
+`doi:10.1234/example` or the `candidate:<id>` returned for a no-identifier record, an explicitly selected local PDF, the original source URL,
 and an access-evidence JSON object. The CLI must match the ID against the whole
 manifest, including failed target candidates, without duplicate ID ambiguity.
 It must save the updated manifest and regenerate reports after **every** result,
@@ -46,15 +46,15 @@ message. Known shadow-library sources are rejected. An unknown or changed host
 does not establish permitted access; a bare OA/institutional label, file presence,
 plugin statement, or record-level OA flag yields `manual_review`. Do not include
 keys, cookies, credentials, or restricted personal information in evidence notes.
-Query strings and fragments are removed from persisted URLs.
+Non-secret query fields are retained; secret query values and fragments are redacted. Valid HTTP(S) evidence may use VPN/private/local hosts or custom ports; no DNS lookup or public-address test is performed. Notes must describe observed evidence but have no arbitrary minimum character count. These changes do not themselves establish access rights.
 
-The library verifies PDF structure and first-page article identity on a temporary
+The library verifies PDF structure and article-header identity on a temporary
 snapshot, then copies accepted bytes under the run's PDF directory without
 overwriting existing files. Ambiguous identity requires manual review; a DOI
 anywhere in a document does not establish identity. SHA-256 prevents counting the
 same PDF twice. The input file remains unchanged. Rejected identity/access attempts
 are recorded without attaching the file; a failed retry preserves an already
-accepted PDF. Ingestion is capped at 100 MiB. Publication version is left unknown
+accepted PDF. The size budget comes from general.max_pdf_mb through --config or the trusted environment-bound configuration. Publication version is left unknown
 unless separately established; institutional PDFs are never relabeled OA.
 
 Accepted records can enter the separate Zotero preview workflow. Browser handoff

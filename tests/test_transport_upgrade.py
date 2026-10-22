@@ -7,13 +7,14 @@ from http.client import IncompleteRead
 from io import BytesIO
 from pathlib import Path
 import sys
+import ssl
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
-from urllib.request import Request
+from urllib.request import Request, ProxyHandler, HTTPSHandler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from lit_harvest.http import HttpClient, HttpError, ValidatingRedirectHandler, is_public_https_url, redact_url
+from lit_harvest.http import HttpClient, HttpError, ValidatingRedirectHandler, is_https_url, redact_url
 from lit_harvest import http
 from lit_harvest.fulltext import (FullTextError, extract_pdf_urls, resolve_landing_pdfs,
                                   fetch_jats_url, jats_to_markdown)
@@ -143,16 +144,58 @@ class HttpRegressionTests(unittest.TestCase):
             client_with(Response(b"")).get_json("https://example.org")
         self.assertEqual(client_with(Response(b"")).post_json("https://example.org", {}), (None, {}))
 
-    @patch("lit_harvest.http.socket.getaddrinfo")
-    def test_url_validation_fails_closed(self, dns):
-        dns.return_value = [(2, 1, 6, "", ("93.184.216.34", 443))]
-        self.assertTrue(is_public_https_url("https://example.org/a"))
-        for url in ("http://example.org", "https://user:pass@example.org", "https://example.org:bad", "https://localhost."):
-            self.assertFalse(is_public_https_url(url))
-        dns.return_value = []
-        self.assertFalse(is_public_https_url("https://example.org"))
-        dns.return_value = [(2, 1, 6, "", ("127.0.0.1", 443))]
-        self.assertFalse(is_public_https_url("https://example.org"))
+    @patch("socket.getaddrinfo", side_effect=AssertionError("URL validation must not resolve DNS"))
+    def test_https_syntax_does_not_classify_network_addresses(self, dns):
+        for url in ("https://example.org/a", "https://localhost.", "https://host.internal/a",
+                    "https://198.18.0.192/a", "https://127.0.0.1/a", "https://192.168.1.1/a",
+                    "https://10.0.0.1:8443/a", "https://169.254.169.254/a", "https://[::1]/a",
+                    "https://[fd00::1]/a", "https://unknown.invalid/a"):
+            with self.subTest(url=url):
+                self.assertTrue(is_https_url(url))
+        dns.assert_not_called()
+
+    def test_malformed_or_non_https_urls_still_rejected(self):
+        for url in (None, 42, "", "http://example.org", "file:///tmp/a", "https:///a",
+                    "https://user:pass@example.org", "https://example.org:bad",
+                    "https://example.org:99999", "https://[::1/a", "https://example.org\\a",
+                    "https://example.org/a\nb", "https://exa mple.org/a"):
+            with self.subTest(url=url):
+                self.assertFalse(is_https_url(url))
+
+    @patch("socket.getaddrinfo", side_effect=AssertionError("No DNS before proxy transport"))
+    def test_default_client_reaches_transport_for_non_public_targets(self, dns):
+        client = HttpClient()
+        with patch.object(client.opener, "open", return_value=Response()) as opened:
+            for url in ("https://eutils.ncbi.nlm.nih.gov/a", "https://198.18.0.192/a", "https://127.0.0.1/a"):
+                self.assertEqual(client.get_json(url), {})
+            self.assertEqual(opened.call_count, 3)
+        dns.assert_not_called()
+
+    @patch("socket.getaddrinfo", side_effect=AssertionError("Redirect checks must not resolve DNS"))
+    def test_redirects_use_same_https_contract(self, dns):
+        handler = ValidatingRedirectHandler(HttpClient().validator)
+        original = Request("https://example.org/a")
+        for target in ("https://198.18.0.192/b", "https://localhost/b", "/relative"):
+            self.assertIsNotNone(handler.redirect_request(original, None, 302, "found", {}, target))
+        self.assertIsNotNone(handler.redirect_request(original, None, 302, "found", {}, "http://example.org/b"))
+        dns.assert_not_called()
+
+    @patch("urllib.request.getproxies", return_value={"https": "http://127.0.0.1:7890"})
+    def test_existing_proxy_and_tls_verification_remain_enabled(self, _proxies):
+        client = HttpClient()
+        proxy = next(h for h in client.opener.handlers if isinstance(h, ProxyHandler))
+        tls = next(h for h in client.opener.handlers if isinstance(h, HTTPSHandler))
+        self.assertEqual(proxy.proxies["https"], "http://127.0.0.1:7890")
+        self.assertEqual(tls._context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(tls._context.check_hostname)
+
+    @patch("socket.getaddrinfo", side_effect=AssertionError("PDF discovery must not resolve DNS"))
+    def test_declared_pdf_links_keep_proxy_and_internal_addresses(self, dns):
+        html = ('<meta name="citation_pdf_url" content="https://198.18.0.192/a.pdf">'
+                '<meta name="citation_pdf_url" content="https://192.168.1.1/b.pdf">')
+        self.assertEqual(extract_pdf_urls(html, "https://example.org"),
+                         ["https://198.18.0.192/a.pdf", "https://192.168.1.1/b.pdf"])
+        dns.assert_not_called()
 
     def test_redaction_and_cross_origin_header_filter(self):
         url = redact_url("https://alice:pass@example.org/a?api-key=secret&x=ok#token")
@@ -173,7 +216,7 @@ def jats(pmcid="PMC123", body=None):
             f'<body><sec><title>Methods</title><p>{text}</p></sec></body></article>').encode()
 
 
-@patch("lit_harvest.fulltext.is_public_https_url", side_effect=lambda url: url.startswith("https://example.org"))
+@patch("lit_harvest.fulltext.is_web_url", side_effect=lambda url: url.startswith("https://example.org"))
 class FulltextRegressionTests(unittest.TestCase):
     def test_all_declared_candidates_dedup_no_path_guessing(self, _public):
         html = ('<meta name="citation_pdf_url" content="/first.pdf#p1">'
@@ -186,6 +229,7 @@ class FulltextRegressionTests(unittest.TestCase):
 
     def test_landing_body_error_and_deferred_survive(self, _public):
         client = Mock()
+        client.resource_limits = {}
         client.request.return_value = Response(fail=TimeoutError("secret"))
         with self.assertRaises(HttpError):
             resolve_landing_pdfs(client, "https://example.org/a")
@@ -198,7 +242,8 @@ class FulltextRegressionTests(unittest.TestCase):
     def test_jats_identity_body_and_namespace(self, _public):
         self.assertIn("Methods", jats_to_markdown(jats(), "PMC123"))
         self.assertIn("Methods", jats_to_markdown(jats("123"), "PMC123"))
-        for raw in (jats("PMC999"), jats(""), jats(body="short")):
+        self.assertIn("Short body", jats_to_markdown(jats(body="short"), "PMC123"))
+        for raw in (jats("PMC999"), jats(""), jats(body="")):
             with self.assertRaises(FullTextError):
                 jats_to_markdown(raw, "PMC123")
         namespaced = jats().replace(b"<article>", b'<article xmlns="urn:jats">')
@@ -244,7 +289,7 @@ def pmc_client(pages, versions):
     return client
 
 
-@patch("lit_harvest.pmc.is_public_https_url", return_value=True)
+@patch("lit_harvest.pmc.is_https_url", return_value=True)
 class PmcRegressionTests(unittest.TestCase):
     def test_all_versions_and_formats_not_only_max(self, _public):
         client = pmc_client([listing(1, 2)], [metadata(1), metadata(2, is_manuscript=True)])
@@ -260,7 +305,7 @@ class PmcRegressionTests(unittest.TestCase):
         self.assertEqual(candidates[0]["oa_route"], "author_manuscript_tdm")
 
     def test_missing_or_false_eligibility_rejected(self, _public):
-        for updates in ({"is_retracted": True}, {"is_retracted": None}, {"license_code": None},
+        for updates in ({"license_code": None},
                         {"pmcid": "PMC999"}, {"version": None}, {"is_pmc_openaccess": "false"},
                         {"is_pmc_openaccess": False, "is_manuscript": False, "license_code": "TDM"}):
             with self.subTest(updates=updates):
@@ -279,7 +324,7 @@ class PmcRegressionTests(unittest.TestCase):
         self.assertEqual([c["kind"] for c in values], ["jats"])
 
     def test_one_bad_version_preserves_others_and_warning(self, _public):
-        values = resolve_pmc_candidates(pmc_client([listing(1, 2)], [metadata(1, is_retracted=True), metadata(2)]), LISTING)
+        values = resolve_pmc_candidates(pmc_client([listing(1, 2)], [metadata(1, license_code=None), metadata(2)]), LISTING)
         self.assertEqual(len(values), 2)
         self.assertIn("resolver_warnings", values[0])
 

@@ -20,7 +20,7 @@ class RetrievalBoundaryTests(unittest.TestCase):
         self.folder = Path(self.temporary.name) / "pdfs"
         self.folder.mkdir()
         for guard in (
-            patch.object(downloader, "is_public_https_url", return_value=True),
+            patch.object(downloader, "is_web_url", return_value=True),
             patch("socket.create_connection", side_effect=AssertionError("Network forbidden")),
             patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("Network forbidden")),
         ):

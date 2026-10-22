@@ -1,13 +1,11 @@
-"""Bounded HTTPS transport with explicit deferred retries and safe diagnostics."""
+"""Bounded web transport; routing belongs to the system, credentials to TLS."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException
-import ipaddress
 import json
 import math
-import socket
 import ssl
 import time
 import threading
@@ -52,7 +50,8 @@ def restore_host_deferrals(values: dict[str, str]) -> None:
             continue
 _SECRET_NAMES = {"apikey", "key", "email", "mailto", "token", "accesstoken",
                  "authorization", "password", "secret", "clientsecret", "signature",
-                 "credential", "xamzsignature", "xamzcredential", "xamzsecuritytoken"}
+                 "credential", "xamzsignature", "xamzcredential", "xamzsecuritytoken",
+                 "session", "sessionid", "sid", "jwt", "auth", "sig", "sas", "cookie"}
 
 
 def _secret_name(value: str) -> bool:
@@ -84,20 +83,37 @@ class HttpError(RuntimeError):
         self.code = code
 
 
-def is_public_https_url(url: str) -> bool:
+def is_web_url(url: str) -> bool:
+    """Validate HTTP(S) syntax, leaving DNS and routing to the system/proxy.
+
+    This is not a public-address or internal-network isolation check.
+    """
     try:
+        if (not isinstance(url, str) or any(c.isspace() or ord(c) < 32 for c in url)
+                or "\\" in url):
+            return False
         parsed = urlparse(url)
-        if (parsed.scheme.casefold() != "https" or not parsed.hostname
-                or parsed.username is not None or parsed.password is not None
-                or any(ord(c) < 32 for c in url) or "\\" in url):
-            return False
-        host = parsed.hostname.casefold().rstrip(".")
-        if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".localhost")):
-            return False
-        addresses = socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
-        return bool(addresses) and all(ipaddress.ip_address(a[4][0]).is_global for a in addresses)
-    except (OSError, TypeError, ValueError):
+        # Accessing port validates its syntax; it must not require a DNS lookup.
+        _ = parsed.port
+        return (parsed.scheme.casefold() in {"http", "https"} and bool(parsed.hostname)
+                and parsed.username is None and parsed.password is None)
+    except (TypeError, ValueError):
         return False
+
+
+def is_https_url(url: str) -> bool:
+    """HTTPS-specific protocol requirement for official objects and credentials."""
+    return is_web_url(url) and urlparse(url).scheme.casefold() == "https"
+
+
+def _anonymous_http(url, headers, method):
+    if urlparse(url).scheme.casefold() != "http":
+        return
+    if method not in {"GET", "HEAD"} or any(_secret_name(k) for k, _ in parse_qsl(urlparse(url).query)):
+        raise HttpError("HTTP is supported only for credential-free reads", url=url, code="insecure_credentials")
+    if any(_secret_name(k) or k.casefold() in {"cookie", "proxy-authorization", "x-api-key"}
+           for k in headers):
+        raise HttpError("Credentials must not be sent over HTTP", url=url, code="insecure_credentials")
 
 
 class ValidatingRedirectHandler(HTTPRedirectHandler):
@@ -109,7 +125,7 @@ class ValidatingRedirectHandler(HTTPRedirectHandler):
                          headers: Any, newurl: str) -> Request | None:
         absolute = urljoin(req.full_url, newurl)
         if not self.validator(absolute):
-            raise HttpError(f"Unsafe redirect rejected: {redact_url(absolute)}",
+            raise HttpError(f"Invalid web redirect rejected: {redact_url(absolute)}",
                             status=code, url=absolute, code="unsafe_url")
         redirected = super().redirect_request(req, fp, code, msg, headers, absolute)
         host = urlparse(absolute).hostname or ""
@@ -124,6 +140,7 @@ class ValidatingRedirectHandler(HTTPRedirectHandler):
                 for name in list(dict(redirected.header_items())):
                     if _secret_name(name) or name.casefold() in {"cookie", "proxy-authorization", "x-api-key"}:
                         redirected.remove_header(name)
+            _anonymous_http(absolute, dict(redirected.header_items()), redirected.get_method())
         return redirected
 
 
@@ -204,13 +221,16 @@ class HttpClient:
                  user_agent: str = "LiteratureHarvester/0.3 (+local-personal-research)",
                  max_retries: int = 2,
                  validate_redirects: Callable[[str], bool] | None = None, *,
-                 max_inline_retry_delay: float = 10, max_retry_wait: float = 30) -> None:
+                 max_inline_retry_delay: float = 10, max_retry_wait: float = 30,
+                 ca_file: str | None = None, resource_limits: dict | None = None) -> None:
         self.timeout = timeout
         self.user_agent = user_agent
         self.max_retries = max(0, int(max_retries))
         self.max_inline_retry_delay = max(0.0, float(max_inline_retry_delay))
         self.max_retry_wait = max(0.0, float(max_retry_wait))
-        self.validator = validate_redirects or is_public_https_url
+        self.validator = validate_redirects or is_web_url
+        self.resource_limits = resource_limits or {}
+        custom_ca = ca_file
         try:
             import certifi
             ca_file = certifi.where()
@@ -221,6 +241,8 @@ class HttpClient:
             except ImportError:
                 ca_file = None
         context = ssl.create_default_context(cafile=ca_file)
+        if custom_ca:
+            context.load_verify_locations(cafile=custom_ca)
         if hasattr(ssl, "enum_certificates"):
             try:
                 for certificate, encoding, trust in ssl.enum_certificates("ROOT"):
@@ -234,7 +256,8 @@ class HttpClient:
                  data: bytes | None, consume: Callable[[Any], Any] | None = None) -> Any:
         safe_url = redact_url(url)
         if not self.validator(url):
-            raise HttpError(f"Unsafe request rejected: {safe_url}", url=url, code="unsafe_url")
+            raise HttpError(f"Invalid web URL rejected: {safe_url}", url=url, code="unsafe_url")
+        _anonymous_http(url, headers or {}, method.upper())
         host = urlparse(url).hostname or ""
         remaining = _HOST_COOLDOWNS.get(host, 0) - time.time()
         if remaining > 0:
@@ -305,9 +328,10 @@ class HttpClient:
                 data: bytes | None = None) -> Any:
         return self._execute(url, method, headers, data)
 
-    @staticmethod
-    def _json_body(response: Any, url: str, allow_empty: bool = False) -> tuple[Any, Any]:
-        limit = 16 * 1024 * 1024
+    def _json_body(self, response: Any, url: str, allow_empty: bool = False) -> tuple[Any, Any]:
+        limit = int(self.resource_limits.get("json_bytes", 16 * 1024 * 1024))
+        if limit < 1:
+            raise ValueError("json_bytes must be positive")
         raw = response.read(limit + 1)
         if len(raw) > limit:
             raise HttpError(f"JSON exceeded {limit} bytes for {redact_url(url)}", url=url, code="body_too_large")

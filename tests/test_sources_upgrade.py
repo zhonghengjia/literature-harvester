@@ -30,8 +30,8 @@ class Response:
     def __exit__(self, *_):
         return False
 
-    def read(self):
-        return self.body
+    def read(self, size=-1):
+        return self.body if size < 0 else self.body[:size]
 
 
 class JSONClient:
@@ -129,7 +129,7 @@ class SourceUpgradeTests(unittest.TestCase):
         self.assertEqual(results.source_status["status"], "partial")
 
     def test_invalid_and_excessive_total_limits_never_request(self):
-        for limit in (0, -1, True, 1.5, 10001):
+        for limit in (0, -1, True, 1.5):
             client = JSONClient([])
             with self.assertRaises(ValueError):
                 search_openalex(client, "x", limit)
@@ -176,21 +176,22 @@ class SourceUpgradeTests(unittest.TestCase):
         self.assertEqual(client.calls[1][1]["cursor"], "crossref-2")
         self.assertEqual(results[0].extra["publication_types"], ["journal-article"])
 
-    def test_s2_paginated_relevance_cap_is_explicit(self):
+    def test_s2_bulk_pagination_above_relevance_cap_is_explicit(self):
         pages = []
         for offset in range(0, 1000, 100):
             payload = {"data": [{"paperId": str(n), "title": f"S2 {n}",
                                 "publicationTypes": ["Review"]}
                                for n in range(offset, offset + 100)]}
-            payload["next"] = offset + 100
+            payload["token"] = str(offset + 100)
             pages.append(payload)
+        pages.append({"data": [{"paperId": "1000", "title": "S2 1000"}]})
         client = JSONClient(pages)
         results = search_semantic_scholar(client, "x", 1001)
-        self.assertEqual(len(results), 1000)
-        self.assertEqual(len(client.calls), 10)
-        self.assertTrue(all(c[1]["limit"] <= 100 for c in client.calls))
-        self.assertEqual(results.source_status["effective_limit"], 1000)
-        self.assertIn("1000", results.source_status["limit_reason"])
+        self.assertEqual(len(results), 1001)
+        self.assertEqual(len(client.calls), 11)
+        self.assertTrue(all(c[0].endswith("/search/bulk") for c in client.calls))
+        self.assertEqual(results.source_status["effective_limit"], 1001)
+        self.assertEqual(results.source_status["rank_semantics"], "bulk_unsorted")
         self.assertEqual(results[0].extra["publication_types"], ["review"])
 
     def test_pubmed_pages_then_bounded_fetch_and_registers_pmc_resolver(self):
@@ -246,7 +247,7 @@ class SourceUpgradeTests(unittest.TestCase):
                          ["hep-th/9901001", "2401.00001", "2401.00002v2"])
         self.assertEqual([c["start"] for c in client.calls], [["0"], ["2"]])
 
-    @patch("lit_harvest.sources.is_public_https_url", side_effect=lambda u: u.startswith("https://"))
+    @patch("lit_harvest.sources.is_web_url", side_effect=lambda u: u.startswith("https://"))
     def test_core_force_examines_all_exact_works_and_all_locations(self, _public):
         record = PaperRecord(title="Original", doi="10.1234/original")
         record.add_pdf_candidate("https://publisher.example/broken.pdf", "openalex")
@@ -257,10 +258,7 @@ class SourceUpgradeTests(unittest.TestCase):
             {"doi": "https://doi.org/10.1234/original", "downloadUrl": "https://repo.example/b.pdf",
              "sourceFulltextUrls": ["https://repo.example/record/b"]},
         ]}
-        unused = JSONClient([])
-        self.assertEqual(enrich_core(unused, [record], "secret"), (0, 0, []))
-        self.assertEqual(unused.calls, [])
-        result = enrich_core(JSONClient([data]), [record], "secret", force=True)
+        result = enrich_core(JSONClient([data]), [record], "secret")
         self.assertEqual(result, (1, 1, []))
         urls = {c["url"] for c in record.pdf_candidates}
         self.assertEqual(len(urls), 5)

@@ -13,11 +13,12 @@ from urllib.parse import urlencode, urlparse, urlunparse
 from uuid import uuid4
 
 from .fulltext import FullTextError, fetch_jats_url, resolve_landing_pdfs
-from .http import HttpClient, HttpError, is_public_https_url, redact_url
+from .http import HttpClient, HttpError, is_web_url, redact_url
 from .identity import PdfValidationError as DownloadError, validate_pdf_structure, verify_pdf_identity
 from .models import PaperRecord, normalize_pmcid, candidate_request_key
 from .pmc import resolve_pmc_candidates, is_pmc_listing_candidate
 from . import __version__
+from .settings import client_options, section, positive
 
 
 SOURCE_PRIORITY = {
@@ -65,6 +66,9 @@ def validate_pdf(path: Path) -> None:
 def sorted_candidates(record: PaperRecord) -> list[dict[str, Any]]:
     return sorted(record.pdf_candidates, key=lambda candidate: (
         KIND_PRIORITY.get(candidate.get("kind", "pdf"), 3),
+        {"publishedVersion": 0, "acceptedVersion": 2, "submittedVersion": 3}.get(candidate.get("version"), 1),
+        candidate.get("is_manuscript") is True,
+        -(candidate.get("article_version") or 0),
         SOURCE_PRIORITY.get(candidate.get("source", ""), 99), candidate.get("url", ""),
     ))
 
@@ -87,13 +91,6 @@ def retrieval_type(candidate: dict[str, Any]) -> str:
     if source in {"core", "core_landing", "openaire", "openaire_landing"}:
         return "repository_pdf"
     return "legal_oa_pdf"
-
-
-def upgrade_http_candidate(url: str) -> str:
-    parsed = urlparse(url)
-    if parsed.scheme.casefold() != "http" or not parsed.netloc or parsed.username or parsed.password:
-        return url
-    return urlunparse(("https", parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
 
 
 def _now() -> str:
@@ -179,7 +176,13 @@ class _TracedClient:
     def request(self, url: str, **kwargs: Any) -> Any:
         self._check_deferred(url)
         try:
-            response = self.client.request(url, **kwargs)
+            if urlparse(url).hostname == "content.openalex.org":
+                budget = getattr(self, "content_budget", None)
+                if budget is None:
+                    raise HttpError("No explicit per-run metered authorization", code="metered_not_authorized")
+                response = budget.request(url, **kwargs)
+            else:
+                response = self.client.request(url, **kwargs)
         except HttpError as exc:
             self._record_http_failure(url, exc)
             raise
@@ -188,6 +191,10 @@ class _TracedClient:
         _attempt(self.record, self.candidate, "request", "response_received", actual,
                  requested_url=redact_url(url))
         return response
+
+    @property
+    def resource_limits(self):
+        return self.client.resource_limits
 
     def get_json(self, url: str, params: dict[str, Any] | None = None,
                  headers: dict[str, str] | None = None) -> Any:
@@ -265,7 +272,8 @@ def _success(record: PaperRecord, path: Path, candidate: dict[str, Any], url: st
 
 def download_record(record: PaperRecord, pdf_dir: Path, max_pdf_mb: int = 100,
                     timeout: int = 30, contact_email: str = "",
-                    allow_fulltext_fallback: bool = True) -> PaperRecord:
+                    allow_fulltext_fallback: bool = True, *, config=None) -> PaperRecord:
+    positive(max_pdf_mb, "max_pdf_mb")
     pdf_dir = Path(pdf_dir)
     pdf_dir.mkdir(parents=True, exist_ok=True)
     final_path = pdf_dir / filename_for(record)
@@ -304,15 +312,18 @@ def download_record(record: PaperRecord, pdf_dir: Path, max_pdf_mb: int = 100,
             errors.append((getattr(exc, "code", "download_failed"), str(exc)))
             _attempt(record, {}, "existing_file", "validation_failed", error=exc, path=str(path.resolve()))
 
-    client = _TracedClient(HttpClient(timeout=timeout, max_retries=2,
-        user_agent=user_agent(contact_email), validate_redirects=is_public_https_url), record, contact_email)
+    options = client_options(config or {})
+    options["timeout"] = timeout
+    client = _TracedClient(HttpClient(**options,
+        user_agent=user_agent(contact_email), validate_redirects=is_web_url), record, contact_email)
+    client.content_budget = (config or {}).get("_content_budget")
     pending = sorted_candidates(record)
     attempted_requests: set[tuple[str, str, str]] = set()
     jats_candidates: list[dict[str, Any]] = []
     while pending:
         candidate = pending.pop(0)
         client.candidate = candidate
-        url = upgrade_http_candidate(str(candidate.get("url", "")))
+        url = str(candidate.get("url", ""))
         kind = candidate.get("kind", "pdf")
         if kind in {"jats", "fulltext_xml"}:
             jats_candidates.append(candidate)
@@ -321,8 +332,8 @@ def download_record(record: PaperRecord, pdf_dir: Path, max_pdf_mb: int = 100,
         if request_key in attempted_requests:
             continue
         attempted_requests.add(request_key)
-        if not is_public_https_url(url):
-            message = "Unsafe or non-public HTTPS URL rejected"
+        if not is_web_url(url):
+            message = "Invalid HTTP(S) URL rejected"
             errors.append(("download_failed", message))
             _attempt(record, candidate, "candidate", "unsafe_url", url, message)
             continue
@@ -352,8 +363,8 @@ def download_record(record: PaperRecord, pdf_dir: Path, max_pdf_mb: int = 100,
 
         headers = {"Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1"}
         if candidate.get("referer"):
-            headers["Referer"] = candidate["referer"]
-        for body_attempt in range(2):
+            headers["Referer"] = redact_url(candidate["referer"])
+        for body_attempt in range(1 if urlparse(url).hostname == "content.openalex.org" else 2):
             part_path = pdf_dir / f".{record.identity_digest}-{uuid4().hex}.pdf.part"
             actual_url = url
             try:
@@ -364,7 +375,7 @@ def download_record(record: PaperRecord, pdf_dir: Path, max_pdf_mb: int = 100,
                     if length and int(length) > max_pdf_mb * 1024 * 1024:
                         raise DownloadError("too_large", f"Content-Length exceeds {max_pdf_mb} MB")
                     first_bytes = _stream_pdf_response(response, part_path, max_pdf_mb * 1024 * 1024,
-                                                       max_pdf_mb, max(timeout * 3, 90))
+                                                       max_pdf_mb, section(config or {}, "transport")["body_timeout_seconds"])
                 if b"%PDF-" not in first_bytes:
                     raise DownloadError("not_pdf", "Response is not a PDF")
                 result = _apply_identity(record, part_path)

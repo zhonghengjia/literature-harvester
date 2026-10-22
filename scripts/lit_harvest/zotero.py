@@ -12,7 +12,7 @@ import secrets
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
-from urllib.request import Request, build_opener
+from urllib.request import Request, build_opener, url2pathname
 
 from .models import PaperRecord, normalize_doi, normalize_title
 from .identity import PdfValidationError, verify_pdf_identity
@@ -115,6 +115,7 @@ class ZoteroLocalClient:
         self.api_version = ""
         self.api_key = ""
         self.auth_remembered = False
+        self.write_authorization_requested = False
 
     def _url(self, path: str) -> str:
         return self.base_url + (path if path.startswith("/") else "/" + path)
@@ -162,13 +163,30 @@ class ZoteroLocalClient:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             merged["Content-Type"] = "application/json"
         if authenticated:
+            if not self.api_key and self.write_authorization_requested:
+                self.authorize()
             if not self.server_id or not self.api_key:
                 raise ZoteroError("Zotero write authorization is not available")
             merged["Zotero-Server-ID"] = self.server_id
             merged["Zotero-API-Key"] = self.api_key
-        raw, response_headers, status = self._raw_request(
-            self._url(path), method=method, data=data, headers=merged
-        )
+        try:
+            raw, response_headers, status = self._raw_request(
+                self._url(path), method=method, data=data, headers=merged
+            )
+        except ZoteroError as exc:
+            if not (authenticated and self.write_authorization_requested and exc.status == 401):
+                raise
+            # 401 confirms rejection, unlike a timeout after an uncertain write.
+            # Retain the same write token and payload for the sole authorized retry.
+            self._clear_cached_auth()
+            self.authorize()
+            merged["Zotero-API-Key"] = self.api_key
+            raw, response_headers, status = self._raw_request(
+                self._url(path), method=method, data=data, headers=merged
+            )
+        finally:
+            if authenticated and not self.auth_remembered:
+                self.api_key = ""
         if not raw:
             return None, response_headers, status
         try:
@@ -247,7 +265,7 @@ class ZoteroLocalClient:
             self._save_cached_auth(self.api_key)
         return self.auth_remembered
 
-    def ensure_write_auth(self, require_persistent: bool = True) -> None:
+    def ensure_write_auth(self, require_persistent: bool = False) -> None:
         status = self.status()
         if not status.reachable:
             raise ZoteroError(status.message)
@@ -258,6 +276,7 @@ class ZoteroLocalClient:
             raise ZoteroError(
                 "Multi-step import requires a persistent local key. Rerun and choose 'Always Allow' in Zotero."
             )
+        self.write_authorization_requested = True
 
     def get_items(self) -> list[dict[str, Any]]:
         payload, _, _ = self._json_request("/users/0/items?format=json")
@@ -342,6 +361,32 @@ class ZoteroLocalClient:
     def get_item(self, key: str) -> dict[str, Any]:
         payload, _, _ = self._json_request(f"/users/0/items/{key}")
         return payload if isinstance(payload, dict) else {}
+
+    def verify_existing_attachment(self, key: str, parent_key: str, record: PaperRecord) -> dict[str, Any]:
+        data = _item_data(self.get_item(key))
+        if data.get("itemType") != "attachment" or data.get("parentItem") != parent_key:
+            raise ZoteroError("Existing attachment parent identity differs")
+        raw, _, _ = self._raw_request(self._url(f"/users/0/items/{key}/file/view/url"))
+        value = raw.decode("utf-8").strip()
+        if value.startswith('"'):
+            value = json.loads(value)
+        parsed = urlparse(value)
+        if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+            raise ZoteroError("Attachment is not a local Zotero file")
+        path = Path(url2pathname(parsed.path))
+        if not path.is_file():
+            raise ZoteroError("Zotero attachment is missing locally")
+        identity = verify_pdf_identity(path, record)
+        if identity.status != "verified":
+            raise ZoteroError("Zotero attachment article identity is not verified")
+        digest = hashlib.md5(usedforsecurity=False)
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024*1024), b""):
+                digest.update(block)
+        if data.get("md5") and digest.hexdigest() != str(data["md5"]).lower():
+            raise ZoteroError("Zotero attachment checksum differs from metadata")
+        return {"attachment_key": key, "parent_key": parent_key, "sha256": sha256_file(path),
+                "identity": identity.to_dict(), "local_bytes_verified": True}
 
     def _attachment_md5(self, key: str, parent_key: str) -> str:
         item = self.get_item(key)
@@ -476,7 +521,7 @@ def _verify_parent(client: ZoteroLocalClient, key: str, record: PaperRecord) -> 
         raise ZoteroError("Parent readback title does not match this record")
 
 
-def plan_import(records: list[PaperRecord], items: list[dict[str, Any]]) -> dict[str, int]:
+def plan_import(records: list[PaperRecord], items: list[dict[str, Any]], *, client=None) -> dict[str, int]:
     by_doi: dict[str, dict[str, Any]] = {}
     by_title: dict[str, dict[str, Any]] = {}
     searchable: list[tuple[str, dict[str, Any]]] = []
@@ -548,11 +593,23 @@ def plan_import(records: list[PaperRecord], items: list[dict[str, Any]]) -> dict
             prior_status = str(previous.get("status", ""))
             if prior_status not in {"imported_with_pdf", "attached_pdf_to_existing"}:
                 plan["status"] = (
-                    "verified_existing_with_pdf" if plan.get("attachment_key") else "verified_existing"
+                    "existing_attachment_unverified" if plan.get("attachment_key") else "verified_existing"
                 )
             else:
                 plan["status"] = prior_status
             plan["error"] = ""
+            if plan.get("attachment_key"):
+                plan["attachment_verification"] = {"local_bytes_verified": False}
+                if client is not None:
+                    try:
+                        verified = client.verify_existing_attachment(plan["attachment_key"], plan["item_key"], record)
+                        if not isinstance(verified, dict) or verified.get("local_bytes_verified") is not True:
+                            raise ZoteroError("No real-file attachment verification returned")
+                        plan["attachment_verification"] = verified
+                        plan["status"] = "verified_existing_with_pdf"
+                    except (ZoteroError, OSError, PdfValidationError, ValueError, AttributeError) as exc:
+                        plan["status"] = "existing_attachment_unverified"
+                        plan["error"] = str(exc)
         record.zotero = plan
         counts[plan["action"]] = counts.get(plan["action"], 0) + 1
     return counts
@@ -561,6 +618,12 @@ def plan_import(records: list[PaperRecord], items: list[dict[str, Any]]) -> dict
 def find_collection_key(collections: list[dict[str, Any]], name: str) -> str:
     if not name:
         return ""
+    if name.startswith("key:"):
+        key = name[4:]
+        matches = [c for c in collections if _item_key(c) == key]
+        if len(matches) != 1:
+            raise ZoteroError("Explicit collection key does not identify exactly one collection")
+        return key
     matches = []
     for collection in collections:
         data = _item_data(collection)
@@ -568,7 +631,7 @@ def find_collection_key(collections: list[dict[str, Any]], name: str) -> str:
             matches.append(str(collection.get("key") or data.get("key") or ""))
     matches = [value for value in matches if value]
     if len(matches) > 1:
-        raise ZoteroError(f"Multiple Zotero collections are named '{name}'; use a unique name")
+        raise ZoteroError(f"Multiple Zotero collections are named '{name}'; select key:COLLECTIONKEY")
     return matches[0] if matches else ""
 
 
@@ -621,10 +684,10 @@ def import_records(
     create_collection: bool = False,
     checkpoint: Callable[[list[PaperRecord]], None] | None = None,
 ) -> dict[str, int]:
-    client.ensure_write_auth(require_persistent=True)
+    client.ensure_write_auth(require_persistent=False)
     items = client.get_items()
     collections = client.get_collections()
-    plan_import(records, items)
+    plan_import(records, items, client=client)
     server_id = getattr(client, "server_id", "")
     server_id = server_id if isinstance(server_id, str) else ""
     for record in records:

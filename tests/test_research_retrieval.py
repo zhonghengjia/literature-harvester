@@ -23,7 +23,7 @@ class ResearchRetrievalTests(unittest.TestCase):
         self.config = copy.deepcopy(pipeline.DEFAULT_CONFIG)
         self.config["sources"] = {key: False for key in self.config["sources"]}
         self.enterContext(patch.dict(http._HOST_COOLDOWNS, {}, clear=True))
-        self.enterContext(patch.object(downloader, "is_public_https_url", return_value=True))
+        self.enterContext(patch.object(downloader, "is_web_url", return_value=True))
 
     def retrieve(self, record, client, enrich=None, hosts=None):
         manifest = pipeline.new_manifest("synthetic", [record], {}, {"target_pdfs": 1})

@@ -67,6 +67,19 @@ def normalize_title(value: str | None) -> str:
     return " ".join("".join(ch if ch.isalnum() else " " for ch in text).split())
 
 
+def normalize_work_alias(value: str) -> str:
+    """Normalize lookup aliases, not a license to fuzzy-merge works."""
+    prefix, separator, tail = value.strip().partition(":")
+    prefix = prefix.casefold()
+    if separator and prefix in {"doi", "pmid", "pmcid", "arxiv", "openalex", "s2", "semantic_scholar"}:
+        if prefix in {"s2", "semantic_scholar"}:
+            prefix = "semantic_scholar"
+        if prefix in {"openalex", "semantic_scholar"}:
+            tail = tail.rstrip("/").rsplit("/", 1)[-1]
+        return f"{prefix}:{tail.casefold()}"
+    return value.strip()
+
+
 def first_nonempty(*values: Any) -> Any:
     for value in values:
         if value not in (None, "", [], {}):
@@ -127,6 +140,12 @@ class PaperRecord:
         self.arxiv_id = normalize_arxiv_id(self.arxiv_id)
         self.openalex_id = identifier_text(self.openalex_id)
         self.semantic_scholar_id = identifier_text(self.semantic_scholar_id)
+        for name in ("year", "citation_count"):
+            value = getattr(self, name)
+            if value is not None:
+                if isinstance(value, bool) or not str(value).isdigit():
+                    raise ValueError(f"Invalid numeric metadata: {name}")
+                setattr(self, name, int(value))
         self.authors = [identifier_text(author) for author in (self.authors or []) if identifier_text(author)]
         self.sources = list(dict.fromkeys(source for source in (self.sources or []) if source))
         self.attempts = [dict(item) for item in (self.attempts or []) if isinstance(item, dict)]
@@ -148,9 +167,12 @@ class PaperRecord:
         for prefix, value in (
             ("doi", normalize_doi(self.doi)), ("pmid", normalize_pmid(self.pmid)),
             ("pmcid", normalize_pmcid(self.pmcid)), ("arxiv", normalize_arxiv_id(self.arxiv_id)),
+            ("openalex", self.openalex_id), ("semantic_scholar", self.semantic_scholar_id),
         ):
             if value:
-                keys.append(f"{prefix}:{value.casefold()}")
+                keys.append(normalize_work_alias(f"{prefix}:{value}"))
+        keys.extend(k for k in self.extra.get("provider_id_aliases", [])
+                    if isinstance(k, str) and k.startswith(("openalex:", "semantic_scholar:")) and k not in keys)
         if self.normalized_title:
             keys.append(f"title:{self.normalized_title}")
         return keys
@@ -191,10 +213,12 @@ class PaperRecord:
 
     def merge(self, other: "PaperRecord") -> "PaperRecord":
         # The pipeline retains and flags conflicts instead of merging them.
-        for name in ("doi", "pmid", "pmcid"):
+        for name in ("doi", "pmid", "pmcid", "arxiv_id"):
             current, incoming = getattr(self, name), getattr(other, name)
             if current and incoming and current != incoming:
                 raise ValueError(f"Conflicting {name} identifiers cannot be merged")
+        provider_aliases = sorted({k for r in (self, other) for k in r.identity_keys
+                                  if k.startswith(("openalex:", "semantic_scholar:"))})
         self.title = first_nonempty(self.title, other.title)
         self.authors = self.authors or other.authors
         self.year = self.year or other.year
@@ -219,6 +243,8 @@ class PaperRecord:
             if hit not in discovery_hits:
                 discovery_hits.append(hit)
         self.extra.update({key: value for key, value in other.extra.items() if value not in (None, "")})
+        if provider_aliases:
+            self.extra["provider_id_aliases"] = provider_aliases
         if discovery_hits:
             self.extra["discovery_hits"] = discovery_hits
         if publication_types:

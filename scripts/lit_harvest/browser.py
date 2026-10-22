@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import ipaddress
 import os
 from pathlib import Path
 import re
@@ -13,6 +12,9 @@ from uuid import uuid4
 from .downloader import filename_for, sha256_file, validate_pdf
 from .identity import PdfValidationError, verify_pdf_identity
 from .models import PaperRecord
+from .http import is_web_url, redact_url
+from .query_plan import candidate_id
+from .settings import DEFAULT_CONFIG, positive
 
 
 ACCEPTED = {"downloaded", "already_downloaded"}
@@ -23,7 +25,6 @@ OA_PROVENANCE_SOURCES = {
     "pmc", "europe_pmc", "pmc_oa_cloud", "arxiv", "biorxiv", "medrxiv",
     "openalex", "unpaywall", "core", "semantic_scholar", "crossref_verified_oa",
 }
-MAX_LOCAL_BYTES = 100 * 1024 * 1024
 
 
 def browser_status() -> dict[str, Any]:
@@ -40,26 +41,10 @@ def browser_status() -> dict[str, Any]:
 
 
 def _safe_url(value: Any) -> str:
-    """Validate offline without DNS, retaining no query/fragment credentials."""
-    if not isinstance(value, str) or not value.strip() or any(ord(c) < 32 for c in value):
+    """Syntax only: evidence is offline, and private/VPN hosts are permitted."""
+    if not isinstance(value, str) or not is_web_url(value.strip()):
         return ""
-    try:
-        parsed = urlsplit(value.strip())
-        host = (parsed.hostname or "").lower().rstrip(".")
-        if parsed.scheme != "https" or not host or parsed.username or parsed.password:
-            return ""
-        if parsed.port not in {None, 443} or "\\" in value or "%" in host:
-            return ""
-        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")) or "." not in host:
-            return ""
-        try:
-            if not ipaddress.ip_address(host).is_global:
-                return ""
-        except ValueError:
-            pass
-        return urlunsplit(("https", host, parsed.path or "/", "", ""))
-    except (TypeError, ValueError):
-        return ""
+    return redact_url(value.strip())
 
 
 def _shadow(value: str) -> bool:
@@ -70,15 +55,17 @@ def _shadow(value: str) -> bool:
 
 
 def _strong_id(record: PaperRecord) -> str:
-    return next((key for key in record.identity_keys if not key.startswith("title:")), "")
+    return next((key for key in record.identity_keys if not key.startswith("title:")),
+                "candidate:" + (record.extra.get("candidate_id") or candidate_id(record)))
 
 
 def select_record(records: Iterable[PaperRecord], record_id: str) -> PaperRecord:
     """Exact DOI/PMID/PMCID/arXiv namespace selection, never a fuzzy title."""
     selected = [record for record in records if record_id.casefold() in
-                [key.casefold() for key in record.identity_keys if not key.startswith("title:")]]
+                [key.casefold() for key in record.identity_keys if not key.startswith("title:")]
+                + [("candidate:" + (record.extra.get("candidate_id") or candidate_id(record))).casefold()]]
     if len(selected) != 1:
-        raise ValueError("record_id must match exactly one DOI/PMID/PMCID/arXiv identifier")
+        raise ValueError("record_id must match exactly one DOI/PMID/PMCID/arXiv/candidate identifier")
     return selected[0]
 
 
@@ -133,7 +120,7 @@ def _access_evidence(source_url: str, basis: Any) -> tuple[str, str, dict[str, A
         return "rejected_source", "Known shadow-library source is disallowed", {}
     source = _safe_url(source_url)
     if not source:
-        return "manual_review", "A public HTTPS original source URL without credentials is required", {}
+        return "manual_review", "A valid original-source HTTP(S) URL is required", {}
     if not isinstance(basis, dict):
         return "manual_review", "An access label alone is insufficient; original-provider evidence is required", {}
     kind = basis.get("kind")
@@ -149,7 +136,7 @@ def _access_evidence(source_url: str, basis: Any) -> tuple[str, str, dict[str, A
     # The user must confirm observation of original-provider evidence. A
     # plugin's success state, file presence, and host spelling are insufficient.
     if (basis.get("confirmed_by") != "user" or basis.get("original_provider_confirmed") is not True
-            or not evidence_url or len(note.strip()) < 20):
+            or not evidence_url or not note.strip()):
         return "manual_review", "User confirmation of observed original-provider evidence is missing; plugin success is not proof", {}
     if kind == "institutional" and basis.get("entitlement_confirmed") is not True:
         return "manual_review", "Institutional access requires explicit user entitlement confirmation", {}
@@ -168,13 +155,15 @@ def _access_evidence(source_url: str, basis: Any) -> tuple[str, str, dict[str, A
 
 def ingest_local_pdf(record: PaperRecord, path: Path, pdf_dir: Path,
                      source_url: str, access_basis: Any,
-                     records: Iterable[PaperRecord]) -> dict[str, Any]:
+                     records: Iterable[PaperRecord], *,
+                     max_pdf_mb=DEFAULT_CONFIG["general"]["max_pdf_mb"]) -> dict[str, Any]:
     """Verify one explicitly selected local PDF and update its record in memory.
 
     The CLI owns manifest/report persistence. Access is never inferred from the
     plugin, hostname, PDF bytes, or the record's is_oa flag. A failure preserves
     an already accepted PDF and records the failed new attempt separately.
     """
+    max_local_bytes = positive(max_pdf_mb, "max_pdf_mb") * 1024 * 1024
     previous_good = record.download_status in ACCEPTED and record.identity_status == "verified"
     provenance: dict[str, Any] = {}
 
@@ -201,8 +190,8 @@ def ingest_local_pdf(record: PaperRecord, path: Path, pdf_dir: Path,
     target_dir = Path(pdf_dir).expanduser().resolve()
     part: Path | None = None
     try:
-        if source.stat().st_size > MAX_LOCAL_BYTES:
-            return finish("too_large", "Local PDF exceeds the 100 MiB ingestion limit")
+        if source.stat().st_size > max_local_bytes:
+            return finish("too_large", f"Local PDF exceeds the configured {max_pdf_mb} MiB ingestion budget")
         target_dir.mkdir(parents=True, exist_ok=True)
         part = target_dir / f".browser-ingest-{uuid4().hex}.part"
         # Verify this stable snapshot, so changes to Downloads during validation
@@ -211,7 +200,7 @@ def ingest_local_pdf(record: PaperRecord, path: Path, pdf_dir: Path,
             copied = 0
             for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
                 copied += len(chunk)
-                if copied > MAX_LOCAL_BYTES:
+                if copied > max_local_bytes:
                     return finish("too_large", "Local PDF grew beyond the ingestion size limit")
                 output_file.write(chunk)
         validate_pdf(part)

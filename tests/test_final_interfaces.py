@@ -34,7 +34,7 @@ class FinalInterfaceChecks(unittest.TestCase):
         http._HOST_COOLDOWNS.clear()
         http._ARXIV_COMPLETED = 0.0
 
-    @patch("lit_harvest.downloader.is_public_https_url", return_value=True)
+    @patch("lit_harvest.downloader.is_web_url", return_value=True)
     @patch("lit_harvest.downloader.time.sleep")
     def test_wrapped_stream_failure_recovers(self, sleep, public):
         client = Mock()
@@ -126,7 +126,7 @@ class FinalInterfaceChecks(unittest.TestCase):
         client.get_collections.return_value = []
         client.get_item.return_value = {"key": "SYNTHETIC", "data": {
             "itemType": "journalArticle", "title": record.title, "DOI": record.doi}}
-        def plan(records, items):
+        def plan(records, items, **kwargs):
             records[0].zotero = {"action": "attach_existing", "match_key": "SYNTHETIC"}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "unbound.pdf"

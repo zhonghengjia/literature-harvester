@@ -5,15 +5,16 @@ import hashlib
 import json
 import re
 from .models import normalize_title
+from .settings import DEFAULT_CONFIG, positive
 
 SOURCES = {"pubmed", "europe_pmc", "crossref", "openalex", "semantic_scholar", "arxiv"}
 NATIVE = {"pubmed", "europe_pmc", "arxiv"}
 
 
-def _text(value, name, limit=2000):
-    if not isinstance(value, str) or not value.strip() or len(value) > limit or any(ord(c) < 32 for c in value):
+def _text(value, name, limit=50000):
+    if not isinstance(value, str) or not value.strip() or len(value) > limit or any(ord(c) < 32 and c not in '\r\n\t' for c in value):
         raise ValueError(f"Invalid {name}")
-    return value.strip()
+    return " ".join(value.split())
 
 
 def _keys(value, allowed, name):
@@ -21,30 +22,51 @@ def _keys(value, allowed, name):
         raise ValueError(f"Unexpected fields in {name}")
 
 
-def validate_plan(plan):
-    _keys(plan, {"schema_version", "question", "scope_note", "concepts", "routes"}, "query plan")
+def validate_plan(plan, limits=None):
+    _keys(plan, {"schema_version", "question", "scope_note", "concepts", "routes", "limits", "query_validation"}, "query plan")
+    supplied = plan.get("limits", {})
+    _keys(supplied, set(DEFAULT_CONFIG["plan_limits"]), "plan limits")
+    bounds = {**DEFAULT_CONFIG["plan_limits"], **(limits or {}), **supplied}
+    for key, value in bounds.items():
+        positive(value, key)
     if type(plan.get("schema_version")) is not int or plan["schema_version"] != 1:
         raise ValueError("Query plan schema_version must be 1")
-    question = _text(plan.get("question"), "question")
+    question = _text(plan.get("question"), "question", bounds["text_chars"])
     concepts = []
-    if not isinstance(plan.get("concepts", []), list) or len(plan.get("concepts", [])) > 12:
-        raise ValueError("At most 12 concepts are allowed")
+    if not isinstance(plan.get("concepts", []), list) or len(plan.get("concepts", [])) > bounds["concepts"]:
+        raise ValueError("Concept count exceeds configured plan budget")
     for item in plan.get("concepts", []):
-        _keys(item, {"id", "terms"}, "concept")
+        _keys(item, {"id", "terms", "mesh_terms"}, "concept")
         name = _text(item.get("id"), "concept id", 64)
         terms = item.get("terms")
-        if not isinstance(terms, list) or not 1 <= len(terms) <= 20:
-            raise ValueError("Each concept requires 1..20 terms")
-        terms = list(dict.fromkeys(_text(term, "concept term", 200) for term in terms))
+        if not isinstance(terms, list) or not 1 <= len(terms) <= bounds["terms"]:
+            raise ValueError("Concept terms exceed configured plan budget")
+        terms = list(dict.fromkeys(_text(term, "concept term", bounds["term_chars"]) for term in terms))
         if any('"' in term or '[' in term or ']' in term for term in terms):
             raise ValueError("Concept terms are literal phrases, not query expressions")
-        concepts.append({"id": name, "terms": terms})
+        concept = {"id": name, "terms": terms}
+        mesh = item.get("mesh_terms", [])
+        if not isinstance(mesh, list) or len(mesh) > bounds["terms"]:
+            raise ValueError("Invalid MeSH terms")
+        if mesh:
+            concept["mesh_terms"] = []
+            for heading in mesh:
+                _keys(heading, {"term", "evidence_url"}, "verified MeSH heading")
+                term = _text(heading.get("term"), "MeSH heading", bounds["term_chars"])
+                evidence = _text(heading.get("evidence_url"), "MeSH verification source")
+                if any(ch in term for ch in '"[]'):
+                    raise ValueError("MeSH heading must be literal")
+                from urllib.parse import urlparse
+                if urlparse(evidence).scheme != "https" or urlparse(evidence).hostname not in {"meshb.nlm.nih.gov", "id.nlm.nih.gov", "www.ncbi.nlm.nih.gov"}:
+                    raise ValueError("MeSH headings require an explicit NLM verification source")
+                concept["mesh_terms"].append({"term": term, "evidence_url": evidence})
+        concepts.append(concept)
     if len({c["id"] for c in concepts}) != len(concepts):
         raise ValueError("Concept ids must be unique")
     by_id = {c["id"]: c for c in concepts}
     routes = plan.get("routes")
-    if not isinstance(routes, list) or not 1 <= len(routes) <= 18:
-        raise ValueError("A plan requires 1..18 routes")
+    if not isinstance(routes, list) or not 1 <= len(routes) <= bounds["routes"]:
+        raise ValueError("Route count exceeds configured plan budget")
     compiled = []
     for item in routes:
         _keys(item, {"id", "source", "query", "syntax", "concept_ids", "limit"}, "route")
@@ -56,8 +78,8 @@ def validate_plan(plan):
             raise ValueError("Unknown source or query syntax")
         if route_id in {"selection", "openalex_content"}:
             raise ValueError("Route id conflicts with a reserved status name")
-        if type(limit) is not int or not 1 <= limit <= 1000:
-            raise ValueError("Each route limit must be 1..1000")
+        if type(limit) is not int or not 1 <= limit <= bounds["route_records"]:
+            raise ValueError("Route record limit exceeds configured plan budget")
         ids = item.get("concept_ids", [])
         if not isinstance(ids, list) or any(not isinstance(i, str) or i not in by_id for i in ids) or len(set(ids)) != len(ids):
             raise ValueError("Route concept_ids must refer to unique declared concepts")
@@ -70,18 +92,30 @@ def validate_plan(plan):
                 if source == "pubmed":
                     return f'"{term}"[Title/Abstract]'
                 return f'{"TITLE_ABS" if source == "europe_pmc" else "all"}:"{term}"'
-            query = " AND ".join("(" + " OR ".join(phrase(t) for t in by_id[i]["terms"]) + ")" for i in ids)
+            groups = []
+            for ident in ids:
+                alternatives = [phrase(t) for t in by_id[ident]["terms"]]
+                if source == "pubmed":
+                    alternatives += [f'"{h["term"]}"[MeSH Terms]' for h in by_id[ident].get("mesh_terms", [])]
+                groups.append("(" + " OR ".join(alternatives) + ")")
+            query = " AND ".join(groups)
             syntax = "native"
         else:
-            query = _text(item.get("query"), "query")
+            query = _text(item.get("query"), "query", bounds["text_chars"])
         if syntax == "native" and source not in NATIVE:
             raise ValueError("Native syntax is not supported for this source")
         compiled.append({"id": route_id, "source": source, "query": query, "syntax": syntax, "limit": limit})
-    if len({r["id"] for r in compiled}) != len(compiled) or sum(r["limit"] for r in compiled) > 10000:
-        raise ValueError("Route ids must be unique and total candidate budget <=10000")
+    if len({r["id"] for r in compiled}) != len(compiled) or sum(r["limit"] for r in compiled) > bounds["total_records"]:
+        raise ValueError("Route ids must be unique and total candidates within configured plan budget")
     normalized = {"schema_version": 1, "question": question, "concepts": concepts, "routes": compiled}
+    normalized["limits"] = bounds
     if plan.get("scope_note"):
-        normalized["scope_note"] = _text(plan["scope_note"], "scope note")
+        normalized["scope_note"] = _text(plan["scope_note"], "scope note", bounds["text_chars"])
+    from .query_lint import inspect_plan
+    normalized["query_validation"] = inspect_plan(normalized)
+    bad = [r for r in normalized["query_validation"]["routes"] if r["errors"]]
+    if bad:
+        raise ValueError("Query syntax error in route " + bad[0]["route_id"] + ": " + str(bad[0]["errors"]))
     return normalized
 
 
@@ -91,7 +125,10 @@ def digest_json(value):
 
 def candidate_id(record):
     # Include all strong IDs: records held apart for an ID conflict must not share a queue ID.
-    return digest_json({"ids": record.identity_keys, "year": record.year, "authors": record.authors})[:24]
+    identity = {"ids": record.identity_keys, "year": record.year, "authors": record.authors}
+    if not any(not k.startswith("title:") for k in record.identity_keys):
+        identity["source_url"] = record.url
+    return digest_json(identity)[:24]
 
 
 def concept_evidence(record, concepts):

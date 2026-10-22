@@ -71,7 +71,7 @@ class SourceAuditTests(unittest.TestCase):
     def test_only_emitted_body_prose_qualifies(self):
         for body in ('<sec><title>' + 'heading ' * 100 + '</title></sec>',
                      '<fig><caption><p>' + 'caption ' * 100 + '</p></caption></fig>',
-                     '<p>short</p>'):
+                     '<p></p>'):
             with self.subTest(body=body[:30]):
                 with self.assertRaises(FullTextError) as caught:
                     jats_to_markdown(jats(body, '<abstract><p>' + 'abstract ' * 100 + '</p></abstract>'), "PMC123")

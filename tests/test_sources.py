@@ -64,8 +64,8 @@ class _Response:
     def __exit__(self, *_):
         return False
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, size=-1) -> bytes:
+        return self.body if size < 0 else self.body[:size]
 
 
 class _PubMedClient:
@@ -183,7 +183,7 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(kinds["https://repo.example/record/1"], "landing")
         self.assertEqual(kinds["https://other.example/record/2"], "landing")
 
-    @patch("lit_harvest.sources.is_public_https_url", return_value=True)
+    @patch("lit_harvest.sources.is_web_url", return_value=True)
     def test_core_requires_key_and_exact_doi(self, _public) -> None:
         record = PaperRecord(title="CORE record", doi="10.1234/core")
         self.assertEqual(enrich_core(object(), [record], ""), (0, 0, []))

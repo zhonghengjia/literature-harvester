@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import socket
 import sys
 import tempfile
 import unittest
@@ -13,7 +12,7 @@ if not SCRIPTS.is_dir():
 sys.path.insert(0, str(SCRIPTS))
 
 from lit_harvest.downloader import (
-    DownloadError, _stream_pdf_response, upgrade_http_candidate,
+    DownloadError, _stream_pdf_response,
 )
 from lit_harvest.pmc import PmcError, resolve_pmc_candidates
 
@@ -83,35 +82,25 @@ class _CloudClient:
 
 class DownloaderTests(unittest.TestCase):
     def setUp(self):
-        dns = patch("socket.getaddrinfo", return_value=[
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
-        ])
+        dns = patch("socket.getaddrinfo", side_effect=AssertionError("DNS forbidden in offline tests"))
         connect = patch("socket.create_connection", side_effect=AssertionError("network forbidden"))
         opener = patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("network forbidden"))
         for guard in (dns, connect, opener):
             guard.start()
             self.addCleanup(guard.stop)
 
-    def test_http_candidate_upgrade_changes_only_transport(self) -> None:
-        self.assertEqual(
-            upgrade_http_candidate("http://repo.example/paper.pdf?download=1"),
-            "https://repo.example/paper.pdf?download=1",
-        )
-        self.assertEqual(
-            upgrade_http_candidate("https://repo.example/paper.pdf"),
-            "https://repo.example/paper.pdf",
-        )
-        self.assertEqual(
-            upgrade_http_candidate("http://user:secret@repo.example/paper.pdf"),
-            "http://user:secret@repo.example/paper.pdf",
-        )
+    def test_source_declared_http_remains_eligible(self) -> None:
+        from lit_harvest.http import is_web_url
+        self.assertTrue(is_web_url("http://repo.example/paper.pdf?download=1"))
+        self.assertFalse(is_web_url("file:///paper.pdf"))
+        self.assertFalse(is_web_url("http://user:secret@repo.example/paper.pdf"))
 
     def test_pmc_cloud_listing_preserves_all_versions_and_rejects_mixed_ids(self) -> None:
         # Approved behavior now retains every eligible version, including the
         # latest; the former max-version-only assertion would lose legal routes.
         client = _CloudClient()
         candidates = resolve_pmc_candidates(client, LISTING_URL)
-        self.assertEqual([item["article_version"] for item in candidates], [1, 2])
+        self.assertEqual([item["article_version"] for item in candidates], [2, 1])
         self.assertEqual({item["pmcid"] for item in candidates}, {"PMC5053142"})
         self.assertEqual([item["kind"] for item in candidates], ["pdf", "pdf"])
         self.assertEqual(len(client.metadata_calls), 2)

@@ -4,7 +4,6 @@ from io import BytesIO
 import hashlib
 import json
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import tempfile
@@ -76,8 +75,7 @@ class Response(BytesIO):
 
 class Offline(unittest.TestCase):
     def setUp(self):
-        dns = patch("socket.getaddrinfo", return_value=[
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))])
+        dns = patch("socket.getaddrinfo", side_effect=AssertionError("DNS forbidden in offline tests"))
         dns.start()
         self.addCleanup(dns.stop)
         for name in ("socket.create_connection", "socket.socket.connect"):
@@ -118,8 +116,9 @@ class SearchPlanTests(Offline):
     def test_budget_is_bounded(self):
         value = plan()
         value["routes"] = [{"id": str(i), "source": "pubmed", "query": "test", "limit": 1000} for i in range(11)]
+        self.assertEqual(len(validate_plan(value)["routes"]), 11)
         with self.assertRaises(ValueError):
-            validate_plan(value)
+            validate_plan(value, {"total_records": 10000})
 
     def test_all_candidates_hits_and_rrf_survive_cap(self):
         def search(source, *args, **kwargs):

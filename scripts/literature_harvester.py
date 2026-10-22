@@ -22,6 +22,7 @@ from lit_harvest.coverage import (
 from lit_harvest.downloader import DownloadError, validate_pdf
 from lit_harvest.downloader import sha256_file
 from lit_harvest.identity import verify_pdf_identity
+from lit_harvest.settings import section
 from lit_harvest.outcomes import ARTICLE_TYPES, summarize_outcomes
 from lit_harvest.reports import write_reports
 from lit_harvest.zotero import (
@@ -55,18 +56,24 @@ def build_parser() -> argparse.ArgumentParser:
     content = subparsers.add_parser("content", help="Prepare source-linked article content without modifying the frozen manifest or PDF metrics")
     content.add_argument("--manifest", required=True)
     content.add_argument("--output-dir", required=True)
-    content.add_argument("--max-records", type=int, default=25)
-    content.add_argument("--local-only", action="store_true", help="No network; parse only identity/hash-verified local PDFs")
+    content.add_argument("--max-records", type=int, help="Task budget; 0 processes the entire selected population")
+    content.add_argument("--batch-size", type=int, help="Checkpoint batch size, not total task size")
+    content.add_argument("--max-seconds", type=int, help="Stop between records at this time budget; 0 has no task deadline")
+    content.add_argument("--resume-index", help="Resume a content index into a new output directory")
+    content.add_argument("--local-only", action="store_true", help="No network; parse identity/hash-verified local PDFs or explicit --local-html")
+    content.add_argument("--local-html", help="Read one saved HTML file for a single-record manifest; implies no network and requires citation identity/body checks")
+    content.add_argument("--cache-dir", help="Opt-in local PDF extraction cache; does not certify reading")
     _common_config(content)
     screen = subparsers.add_parser("screen", help="Record project-specific screening decisions without deleting candidates")
     screen.add_argument("--manifest", required=True)
     screen.add_argument("--decisions", required=True)
     screen.add_argument("--output-dir", required=True)
+    screen.add_argument("--include-uncertain", action="store_true", help="Obtain full text for assessment without changing uncertain to included")
     _common_config(screen)
     reading = subparsers.add_parser("reading-pack", help="Prepare ordered source chunks; preparation is not AI reading")
     reading.add_argument("--document", required=True)
     reading.add_argument("--question", required=True)
-    reading.add_argument("--max-chars", type=int, default=24000)
+    reading.add_argument("--max-chars", type=int)
     reading.add_argument("--start-chunk", type=int, default=0)
     reading.add_argument("--output-dir", required=True)
     _common_config(reading)
@@ -75,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
     receipt.add_argument("--receipt", required=True)
     receipt.add_argument("--output-dir", required=True)
     _common_config(receipt)
+    continuation = subparsers.add_parser("reading-next", help="Verify prior evidence and prepare the next ordered reading pack")
+    continuation.add_argument("--receipt", required=True, help="Verified reading-receipt.json")
+    continuation.add_argument("--output-dir", required=True)
+    continuation.add_argument("--max-chars", type=int)
+    _common_config(continuation)
 
     run = subparsers.add_parser("run", help="Search, deduplicate, download OA PDFs, and write reports")
     run.add_argument("--query", required=True, help="Research topic, title, DOI, PMID, PMCID, or arXiv ID")
@@ -106,10 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
     queue.add_argument("--manifest", required=True)
     local = subparsers.add_parser("browser-ingest", help="Verify one user-downloaded file and original-source evidence")
     local.add_argument("--manifest", required=True)
-    local.add_argument("--record-id", required=True, help="Exact namespaced DOI, PMID, PMCID or arXiv ID")
+    local.add_argument("--record-id", required=True, help="Exact namespaced DOI, PMID, PMCID, arXiv or candidate ID")
     local.add_argument("--pdf", required=True)
     local.add_argument("--source-url", required=True)
     local.add_argument("--access-basis-json", required=True, help="Path to user-confirmed original-source evidence JSON")
+    _common_config(local)
 
     diagnose = subparsers.add_parser(
         "diagnose",
@@ -163,12 +176,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required acknowledgement that this command mutates the local Zotero library",
     )
     _common_config(ingest)
+    for name, help_text in {
+        "query-check": "Conservative syntax diagnostics; not a completeness certificate",
+        "expand": "One-hop citation child run with resumable page state",
+        "content-next": "Extract only unprocessed PDF pages into a new document",
+        "content-find": "Local lexical lookup with source locators, not full-paper reading",
+        "assets-resume": "Reuse hash-verified assets and retry the declared pending inventory",
+        "evaluate": "Fixed judged-set retrieval metrics with explicit unknowns",
+    }.items():
+        extension = subparsers.add_parser(name, help=help_text)
+        extension.add_argument("--output-dir", required=True)
+        _common_config(extension)
+        if name == "query-check":
+            extension.add_argument("--plan", required=True)
+        elif name == "expand":
+            extension.add_argument("--manifest", required=True)
+            extension.add_argument("--seed", action="append", required=True, dest="seeds")
+            extension.add_argument("--direction", choices=["both", "referenced", "citing"], default="both")
+            extension.add_argument("--max-pages", type=int, default=5)
+            extension.add_argument("--max-results", type=int, default=500, help="Budget per seed/direction per invocation")
+            extension.add_argument("--resume-state")
+        elif name == "evaluate":
+            extension.add_argument("--manifest", required=True)
+            extension.add_argument("--benchmark", required=True)
+            extension.add_argument("--k", type=int, default=25)
+        else:
+            extension.add_argument("--document", required=True)
+            if name == "content-next":
+                extension.add_argument("--max-pages", type=int, default=0)
+                extension.add_argument("--cache-dir", default="")
+            elif name == "content-find":
+                extension.add_argument("--query", required=True)
+                extension.add_argument("--section", default="")
+                extension.add_argument("--limit", type=int, default=10)
+            else:
+                extension.add_argument("--local-only", action="store_true")
     return parser
 
 
 def _client(args: argparse.Namespace, config: dict[str, Any]) -> ZoteroLocalClient:
     base_url = args.zotero_base_url or config["zotero"]["base_url"]
-    return ZoteroLocalClient(base_url=base_url)
+    return ZoteroLocalClient(base_url=base_url, timeout=section(config, "zotero")["timeout_seconds"])
 
 
 def command_run(args: argparse.Namespace) -> int:
@@ -177,12 +225,12 @@ def command_run(args: argparse.Namespace) -> int:
     if args.target_pdfs is not None:
         if args.no_download:
             raise ValueError("--target-pdfs cannot be combined with --no-download")
-        if args.target_pdfs < 1 or args.target_pdfs > 100:
-            raise ValueError("--target-pdfs must be between 1 and 100")
+        if args.target_pdfs < 1:
+            raise ValueError("--target-pdfs must be positive")
         if args.max_results is None:
             max_results = max(args.target_pdfs, int(config["general"]["max_candidates"]))
-    if not 1 <= max_results <= 10000:
-        raise ValueError("--max-results must be between 1 and 10000")
+    if not 1 <= max_results <= section(config, "search")["max_records"]:
+        raise ValueError("--max-results exceeds the configured search budget")
     run_dir, manifest, records = run_pipeline(
         args.query,
         config,
@@ -207,11 +255,11 @@ def command_run(args: argparse.Namespace) -> int:
 
 
 def command_research(args: argparse.Namespace) -> int:
-    from lit_harvest.reading import read_json, prepare_content, screen_candidates, prepare_reading, verify_receipt
+    from lit_harvest.reading import read_json, prepare_content, screen_candidates, prepare_reading, verify_receipt, next_reading
     from lit_harvest.query_plan import validate_plan
     config = load_config(args.config)
     if args.command == "discover":
-        plan = validate_plan(read_json(args.plan))
+        plan = validate_plan(read_json(args.plan), section(config, "plan_limits"))
         directory, manifest, records = run_pipeline(plan["question"], config, args.queue_size,
             args.output_dir, args.download, article_types=args.article_type, query_plan=plan)
         write_reports(directory, manifest, records)
@@ -221,12 +269,16 @@ def command_research(args: argparse.Namespace) -> int:
                   "source_status": states, "research_context": manifest["research_context"]}
         failed = any(states[r["id"]]["status"] in {"error", "partial", "disabled"} for r in plan["routes"])
     elif args.command == "content":
+        if args.cache_dir is not None:
+            config.setdefault("content", {})["cache_dir"] = args.cache_dir
         directory, index = prepare_content(args.manifest, args.output_dir, config,
-            local_only=args.local_only, max_records=args.max_records)
+            local_only=args.local_only, max_records=args.max_records, batch_size=args.batch_size,
+            max_seconds=args.max_seconds, resume_index=args.resume_index, local_html=args.local_html)
         result = {"run_dir": str(directory), "content_index": str(directory / "content-index.json"), **index["metrics"]}
         failed = any(r["status"] != "extracted" for r in index["records"])
     elif args.command == "screen":
-        directory, ledger = screen_candidates(args.manifest, args.decisions, args.output_dir, config)
+        directory, ledger = screen_candidates(args.manifest, args.decisions, args.output_dir, config,
+            include_uncertain=args.include_uncertain)
         result = {"ledger": str(directory / "screening.json"), "manifest": str(directory / "manifest.json"),
                   "selected_for_reading": len(ledger["included_ids"]), "decisions": len(ledger["decisions"]), "unreviewed": len(ledger["unreviewed_ids"])}
         failed = False
@@ -236,6 +288,10 @@ def command_research(args: argparse.Namespace) -> int:
         result = {"pack": str(directory / "reading-pack.json"), "reader": str(directory / "reading-pack.md"),
                   "state": pack["state"], "chunks": len(pack["chunks"]), "next_start_chunk": pack["next_start_chunk"],
                   "remaining_chunks": pack["remaining_chunks"]}
+        failed = False
+    elif args.command == "reading-next":
+        directory, pack = next_reading(args.receipt, args.output_dir, config, max_chars=args.max_chars)
+        result = {"pack": str(directory / "reading-pack.json") if directory else None, **pack}
         failed = False
     else:
         directory, receipt = verify_receipt(args.pack, args.receipt, args.output_dir, config)
@@ -268,7 +324,8 @@ def command_browser(args: argparse.Namespace) -> int:
     evidence = json.loads(Path(args.access_basis_json).expanduser().read_text(encoding="utf-8"))
     manifest_path = Path(args.manifest).expanduser().resolve()
     result = ingest_local_pdf(record, Path(args.pdf), manifest_path.parent / "pdfs",
-                              args.source_url, evidence, records)
+                              args.source_url, evidence, records,
+                              max_pdf_mb=load_config(getattr(args, "config", None))["general"]["max_pdf_mb"])
     manifest["schema_version"] = 2
     manifest.pop("download_attempts", None)
     manifest["records"] = [item.to_dict() for item in records]
@@ -371,7 +428,7 @@ def command_zotero_plan(args: argparse.Namespace) -> int:
         for record in all_records:
             if id(record) not in selected_ids:
                 record.zotero = {}
-    counts = plan_import(records, client.get_items())
+    counts = plan_import(records, client.get_items(), client=client)
     collection_name = args.collection or config["zotero"].get("collection", "")
     collection_key = find_collection_key(client.get_collections(), collection_name)
     manifest["records"] = [record.to_dict() for record in all_records]
@@ -445,10 +502,56 @@ def command_zotero_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_extension(args):
+    from lit_harvest.pipeline import create_run_dir
+    from lit_harvest.reading import read_json, write_json
+    config = load_config(args.config)
+    failed = False
+    if args.command == "query-check":
+        from lit_harvest.query_plan import validate_plan
+        plan = validate_plan(read_json(args.plan), section(config, "plan_limits"))
+        result = plan["query_validation"]
+        directory = create_run_dir("query-check", config, args.output_dir)
+        write_json(directory / "query-validation.json", result)
+    elif args.command == "expand":
+        from lit_harvest.relations import expand
+        directory, manifest = expand(args.manifest, args.output_dir, config, seeds=args.seeds,
+            direction=args.direction, max_pages=args.max_pages, max_results=args.max_results, resume_state=args.resume_state)
+        result = {"manifest": str(directory / "manifest.json"), "records": len(manifest["records"]),
+                  "source_status": manifest["source_status"]}
+        failed = any(s["status"] != "complete" for s in manifest["source_status"].values())
+    elif args.command == "content-next":
+        from lit_harvest.content_store import next_pages
+        directory, document = next_pages(args.document, args.output_dir, config, max_pages=args.max_pages,
+            cache_dir=args.cache_dir or section(config, "content")["cache_dir"])
+        result = {"document": str(directory / "document.json"), "coverage": document["coverage"], "gaps": document["gaps"]}
+        failed = any(g.get("reason") == "page_limit" for g in document["gaps"])
+    elif args.command == "assets-resume":
+        from lit_harvest.assets import resume_assets
+        directory, document = resume_assets(args.document, args.output_dir, config, local_only=args.local_only)
+        result = {"document": str(directory / "document.json"), **document["asset_summary"]}
+        failed = bool(result["pending"])
+    else:
+        if args.command == "content-find":
+            from lit_harvest.content_store import find_content
+            result = find_content(args.document, args.query, limit=args.limit, section_filter=args.section)
+            filename = "content-hits.json"
+        else:
+            from lit_harvest.evaluation import evaluate
+            result = evaluate(args.benchmark, args.manifest, k=args.k)
+            filename = "evaluation.json"
+        directory = create_run_dir(args.command, config, args.output_dir)
+        write_json(directory / filename, result)
+    print(json.dumps({"run_dir": str(directory), **result}, ensure_ascii=False, indent=2))
+    return 2 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command in {"discover", "content", "screen", "reading-pack", "reading-receipt"}:
+        if args.command in {"query-check", "expand", "content-next", "content-find", "assets-resume", "evaluate"}:
+            return command_extension(args)
+        if args.command in {"discover", "content", "screen", "reading-pack", "reading-receipt", "reading-next"}:
             return command_research(args)
         if args.command == "run":
             return command_run(args)

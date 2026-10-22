@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 from io import BytesIO
 from pathlib import Path
-import socket
 import sys
 import tempfile
 import unittest
@@ -35,9 +34,7 @@ class _OfflineTests(unittest.TestCase):
     """Keep URL validation real, but never perform DNS or network I/O."""
 
     def setUp(self):
-        dns = patch("socket.getaddrinfo", return_value=[
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
-        ])
+        dns = patch("socket.getaddrinfo", side_effect=AssertionError("DNS forbidden in offline tests"))
         connect = patch("socket.create_connection", side_effect=AssertionError("network forbidden"))
         opener = patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("network forbidden"))
         for guard in (dns, connect, opener):
@@ -140,8 +137,9 @@ class FullTextTests(_OfflineTests):
         self.assertIn("# Test", markdown)
         self.assertIn("## Results", markdown)
         self.assertIn("word word word", markdown)
+        self.assertIn("Short body", jats_to_markdown(b"<article><body><p>short</p></body></article>"))
         with self.assertRaises(FullTextError) as raised:
-            jats_to_markdown(b"<article><body><p>short</p></body></article>")
+            jats_to_markdown(b"<article><body><p></p></body></article>")
         self.assertEqual(raised.exception.code, "no_usable_body")
 
     def test_fetch_jats_rejects_non_xml(self) -> None:

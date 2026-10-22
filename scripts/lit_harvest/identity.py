@@ -95,10 +95,11 @@ def identity_from_first_page(text: str, record: PaperRecord) -> IdentityResult:
     # A title is only evidence in the article header, not in prose later on
     # the first page. Exact normalized wording tolerates punctuation/line wrap.
     header = normalize_title(front[:6000])
-    title_match = len(title) >= 20 and f" {title} " in f" {header} "
+    title_match = bool(title) and f" {title} " in f" {header} "
     expected_dois = {normalize_doi(record.doi)} - {""}
     if record.extra.get("version_relation_confidence") == "high":
         expected_dois.add(normalize_doi(record.extra.get("preprint_doi")))
+    expected_dois.update(normalize_doi(v) for v in record.extra.get("approved_preprint_dois", []))
     expected_dois.discard("")
     observed_dois = {normalize_doi(match.group(0)) for match in DOI_RE.finditer(front)} - {""}
     matching_dois = sorted(expected_dois & observed_dois)
@@ -118,7 +119,7 @@ def identity_from_first_page(text: str, record: PaperRecord) -> IdentityResult:
             continue
         # Family Initials and Given Family are both common source formats.
         surname = parts[0] if len(parts) > 1 and len(parts[-1]) <= 2 else parts[-1]
-        if len(surname) >= 3:
+        if len(surname) >= 2:
             author_tokens.add(surname)
     author_match = bool(author_tokens & set(header.split()))
     evidence = {
@@ -128,9 +129,9 @@ def identity_from_first_page(text: str, record: PaperRecord) -> IdentityResult:
     }
     if not normalized:
         return IdentityResult("manual_review", "First page has no extractable text; OCR/manual identity review is required", evidence)
-    if title_match and matching_dois:
+    if title_match and matching_dois and (len(title) >= 20 or author_match):
         return IdentityResult("verified", "Article title and expected DOI agree on the first page", evidence)
-    if title_match and author_match and not observed_dois:
+    if title_match and len(title) >= 20 and author_match and not observed_dois:
         return IdentityResult("verified", "Specific title and author agree in the first-page header; no conflicting DOI is present", evidence)
     if title_match and expected_dois and observed_dois and not matching_dois:
         return IdentityResult("manual_review", "Title agrees but first-page DOI is not an approved identifier/version relation", evidence)
@@ -139,11 +140,51 @@ def identity_from_first_page(text: str, record: PaperRecord) -> IdentityResult:
     return IdentityResult("manual_review", "First-page title/identifier evidence is insufficient to bind this PDF to the record", evidence)
 
 
-def verify_pdf_identity(path: Path, record: PaperRecord) -> IdentityResult:
+def verify_pdf_identity(path: Path, record: PaperRecord, *, allow_ocr=True) -> IdentityResult:
     try:
         text = read_first_page(path)
     except PdfValidationError as exc:
         if exc.code in {"validation_unavailable", "manual_review"}:
             return IdentityResult("manual_review", str(exc), {"validation_error": exc.code})
         raise
-    return identity_from_first_page(text, record)
+    result = identity_from_first_page(text, record)
+    if result.status == "verified" or result.evidence.get("supplementary") or result.evidence.get("related_article_notice"):
+        return result
+    # Only a cover page without conflicting publication IDs may defer identity.
+    if (result.evidence.get("first_page_dois") or result.evidence.get("first_page_arxiv_ids")
+            or result.evidence.get("reference_section_excluded")):
+        return result
+    if text.strip() and not re.search(r"(?im)\b(?:cover page|downloaded from|repository cover|this is a cover|author accepted manuscript)\b", text):
+        return result
+    backend_name, backend = _pdf_backend()
+    try:
+        if backend_name == "pymupdf":
+            with backend.open(path) as document:
+                if allow_ocr and not text.strip():
+                    try:
+                        textpage = document[0].get_textpage_ocr(language="eng", dpi=150, full=True)
+                        value = document[0].get_text("text", textpage=textpage)[:20000]
+                        checked = identity_from_first_page(value, record)
+                        if checked.status == "verified":
+                            return IdentityResult("verified", "Local OCR header matches article identity",
+                                                  {**checked.evidence, "identity_text_origin": "local_OCR"})
+                        if checked.evidence.get("first_page_dois") or checked.evidence.get("supplementary"):
+                            return checked
+                    except Exception as exc:
+                        result = IdentityResult(result.status, result.reason,
+                                                {**result.evidence, "local_ocr_error": type(exc).__name__})
+                pages = [(i+1, document[i].get_text("text", sort=True)[:20000]) for i in range(1, min(3, document.page_count))]
+        else:
+            with path.open("rb") as stream:
+                document = backend(stream)
+                pages = [(i+1, (document.pages[i].extract_text() or "")[:20000]) for i in range(1, min(3, len(document.pages)))]
+        for number, value in pages:
+            checked = identity_from_first_page(value, record)
+            if checked.status == "verified" and checked.evidence.get("matching_dois"):
+                return IdentityResult("verified", "Title and approved DOI agree after an identifier-free cover page",
+                                      {**checked.evidence, "page": number, "cover_page_examined": True})
+            if checked.evidence.get("supplementary") or checked.evidence.get("related_article_notice") or checked.evidence.get("first_page_dois"):
+                break
+    except Exception as exc:
+        return IdentityResult(result.status, result.reason, {**result.evidence, "later_page_error": type(exc).__name__})
+    return result
