@@ -11,7 +11,7 @@ from .identity import _pdf_backend, verify_pdf_identity
 from .models import normalize_doi
 from .settings import DEFAULT_CONFIG, positive
 
-PARSER_VERSION = "article-document/3"
+PARSER_VERSION = "article-document/4"
 
 
 def tag(node):
@@ -66,7 +66,8 @@ def jats_document(raw, record, *, max_bytes=DEFAULT_CONFIG["resources"]["xml_byt
     def add(node, kind, section, **fields):
         element = {"id": f"e{len(doc['elements'])+1:05d}", "kind": kind,
                    "text": text(node), "section": list(section), "xml_path": paths[id(node)],
-                   "source_id": node.get("id", ""), **fields}
+                   "source_id": node.get("id", ""),
+                   "content_role": "abstract" if section[:1] == ["Abstract"] else "body" if section[:1] == ["Body"] else "backmatter", **fields}
         doc["elements"].append(element)
         return element
     known_containers = {"body", "back", "sec", "abstract", "list", "boxed-text", "disp-quote", "ref-list", "fn-group", "app-group", "app", "floats-group", "speech", "statement", "table-wrap-group", "fig-group", "disp-formula-group"}
@@ -90,7 +91,7 @@ def jats_document(raw, record, *, max_bytes=DEFAULT_CONFIG["resources"]["xml_byt
             element["xrefs"] = [{"rid": n.get("rid", ""), "type": n.get("ref-type", ""), "text": text(n)} for n in node.iter() if tag(n) == "xref"]
             # Inline formulas and nested figures/tables need their own non-lossy representation.
             for child in node.iter():
-                if child is not node and tag(child) in {"inline-formula", "disp-formula", "table-wrap", "fig", "supplementary-material"}:
+                if child is not node and tag(child) in {"inline-formula", "disp-formula", "table-wrap", "fig", "supplementary-material", "inline-supplementary-material", "media", "graphic", "inline-graphic"}:
                     walk(child, section)
         elif kind == "table-wrap":
             rows = []
@@ -105,10 +106,17 @@ def jats_document(raw, record, *, max_bytes=DEFAULT_CONFIG["resources"]["xml_byt
                 doc["gaps"].append({"element_id": element["id"], "reason": "table_has_no_parsed_cells"})
         elif kind in {"inline-formula", "disp-formula"}:
             add(node, "formula", section, source_xml=ET.tostring(node, encoding="unicode"), interpretation="not_verified")
-        elif kind in {"fig", "supplementary-material", "media", "graphic"}:
+        elif kind in {"fig", "supplementary-material", "inline-supplementary-material", "media", "graphic", "inline-graphic"}:
             links = [value for n in node.iter() for key, value in n.attrib.items() if key.split("}")[-1] == "href"]
-            element = add(node, "figure" if kind == "fig" else "supplement" if kind == "supplementary-material" else "media", section,
-                          resource_references=links, resource_status="not_acquired")
+            supplementary = "supplementary-material" in kind
+            declared = [{"href": value, "kind": "supplement" if supplementary else "figure",
+                         "source_dom_path": paths[id(n)], "label": text(node)}
+                        for n in node.iter() for key, value in n.attrib.items() if key.split("}")[-1] == "href"]
+            element = add(node, "figure" if kind == "fig" else "supplement" if supplementary else "media", section,
+                          resource_references=links, declared_resources=declared, resource_status="not_acquired")
+            # The container already inventories its descendant hrefs. A parent
+            # paragraph's descendant traversal must not re-emit each media node.
+            visited.update(id(n) for n in node.iter())
             doc["gaps"].append({"element_id": element["id"], "reason": "resource_content_not_processed"})
         else:
             if text(node):
@@ -225,7 +233,7 @@ def element_reading_text(element):
         raise ValueError("Document element text must be a string")
     if element["kind"] == "table":
         value += "\n\nStructured table:\n" + json.dumps(
-            {k: element[k] for k in ("caption", "rows", "footnotes") if k in element}, ensure_ascii=False)
+            {k: element[k] for k in ("caption", "rows", "footnotes", "merged_ranges", "office_part", "worksheet_state") if k in element}, ensure_ascii=False)
     if element["kind"] == "formula" and element.get("source_xml"):
         value += "\n\nSource formula XML:\n" + element["source_xml"]
     if element.get("resource_references"):
@@ -246,6 +254,7 @@ def element_locator(doc, element, start=0, end=None):
             "extraction_sha256": hashlib.sha256(json.dumps(contract, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
             "element_id": element["id"], "text_sha256": hashlib.sha256(value.encode()).hexdigest(),
             "char_start": start, "char_end": end, "offset_basis": "element_reading_text_unicode_codepoints",
+            **({"object_source": element["object_source"]} if element.get("object_source") else {}),
             **{k: element[k] for k in ("page", "bbox", "xml_path", "dom_path", "source_id", "section") if k in element}}
 
 

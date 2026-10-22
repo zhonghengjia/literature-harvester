@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from .article_document import jats_document, render_document, element_reading_text, element_locator
-from .content_store import cached_pdf_document as pdf_document
+from .content_store import cached_pdf_document as pdf_document, verify_document_sources
 from .html_document import html_document
 from .downloader import user_agent, sha256_file, _safe_message, download_record
 from .fulltext import _fetch_bounded, MAX_XML_BYTES, FullTextError
@@ -237,6 +237,7 @@ def prepare_content(manifest_path, output_dir, config, *, local_only=False, max_
                 doc = read_json(path)
                 if sha256_file(Path(doc["source"]["artifact"])) != doc["source_sha256"]:
                     raise ValueError("Resume source artifact checksum changed")
+                verify_document_sources(doc)
     directory = create_run_dir("article-content", config, output_dir)
     config = bind_budget(config, env, directory)
     restore_host_deferrals(manifest.get("host_retry_at", {}))
@@ -371,6 +372,7 @@ def prepare_reading(document_path, output_dir, config, *, question, max_chars=No
         raise ValueError("Unsupported article document")
     if sha256_file(Path(doc["source"]["artifact"])) != doc["source_sha256"]:
         raise ValueError("Source artifact checksum changed")
+    verify_document_sources(doc)
     chunks = _chunks(doc, chunk_chars)
     if type(start_chunk) is not int or start_chunk < 0 or start_chunk >= len(chunks):
         raise ValueError("start_chunk must identify an available chunk")
@@ -414,6 +416,7 @@ def verify_receipt(pack_path, receipt_path, output_dir, config):
     doc = read_json(doc_path)
     if sha256_file(Path(doc["source"]["artifact"])) != pack["source_sha256"]:
         raise ValueError("Source artifact checksum changed")
+    verify_document_sources(doc)
     originals = {c["id"]: c for c in _chunks(doc, pack.get("chunk_chars", 4000), version=pack.get("schema_version", 1))}
     offered = {c["id"]: c for c in pack["chunks"]}
     if len(offered) != len(pack["chunks"]) or any(c != originals.get(i) for i, c in offered.items()):
@@ -489,6 +492,7 @@ def _validate_previous_receipt(reference):
         doc = read_json(doc_path)
         if sha256_file(Path(doc["source"]["artifact"])) != pack["source_sha256"]:
             raise ValueError("Previous source artifact checksum changed")
+        verify_document_sources(doc)
         originals = {c["id"]: c for c in _chunks(doc, pack.get("chunk_chars", 4000), version=pack.get("schema_version", 1))}
         offered = {c["id"]: c for c in pack["chunks"]}
         if any(c != originals.get(i) for i, c in offered.items()):

@@ -272,7 +272,7 @@ def load_manifest(path):
         raise ValueError("Unsupported or invalid manifest schema")
     context = manifest.get("research_context")
     if context:
-        for name in ("query-plan.json", "candidates.json"):
+        for name in ("query-plan.json", "candidates.json", *(["work-families.json"] if "work-families.json" in context else [])):
             ref = context.get(name, {})
             source = Path(ref.get("path", ""))
             if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != ref.get("sha256"):
@@ -407,6 +407,12 @@ def run_pipeline(query, config, max_results, output_dir, download, target_pdfs=N
             path = run_dir / name
             path.write_text(json.dumps(_redact(value, config, env), ensure_ascii=False, indent=2), encoding="utf-8")
             context[name] = {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        from .work_families import build_work_families
+        family_path = run_dir / "work-families.json"
+        families = build_work_families(records.candidates)
+        family_path.write_text(json.dumps(families, ensure_ascii=False, indent=2), encoding="utf-8")
+        context["work-families.json"] = {"path": str(family_path.resolve()), "sha256": hashlib.sha256(family_path.read_bytes()).hexdigest(),
+                                         "counts": families["counts"], "record_population_unchanged": True}
         manifest["research_context"] = context
     save_manifest(run_dir/"manifest.json", manifest)
     if download:

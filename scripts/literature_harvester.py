@@ -178,6 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
     _common_config(ingest)
     for name, help_text in {
         "query-check": "Conservative syntax diagnostics; not a completeness certificate",
+        "coverage-plan": "Prepare a reviewable complementary query strategy at a fixed per-source result budget",
+        "work-families": "Non-destructive version families; retain every original record and DOI",
         "expand": "One-hop citation child run with resumable page state",
         "content-next": "Extract only unprocessed PDF pages into a new document",
         "content-find": "Local lexical lookup with source locators, not full-paper reading",
@@ -187,8 +189,12 @@ def build_parser() -> argparse.ArgumentParser:
         extension = subparsers.add_parser(name, help=help_text)
         extension.add_argument("--output-dir", required=True)
         _common_config(extension)
-        if name == "query-check":
+        if name in {"query-check", "coverage-plan"}:
             extension.add_argument("--plan", required=True)
+            if name == "coverage-plan":
+                extension.add_argument("--per-source-budget", type=int, default=100)
+        elif name == "work-families":
+            extension.add_argument("--manifest", required=True)
         elif name == "expand":
             extension.add_argument("--manifest", required=True)
             extension.add_argument("--seed", action="append", required=True, dest="seeds")
@@ -507,7 +513,22 @@ def command_extension(args):
     from lit_harvest.reading import read_json, write_json
     config = load_config(args.config)
     failed = False
-    if args.command == "query-check":
+    if args.command == "coverage-plan":
+        from lit_harvest.coverage_plan import build_coverage_plan
+        result = build_coverage_plan(read_json(args.plan), args.per_source_budget)
+        directory = create_run_dir("coverage-plan", config, args.output_dir)
+        write_json(directory / "coverage-plan.json", result)
+        write_json(directory / "query-plan.json", result["query_plan"])
+    elif args.command == "work-families":
+        from lit_harvest.work_families import build_work_families
+        from lit_harvest.outcomes import collect_population
+        manifest, records = load_manifest(Path(args.manifest))
+        families = build_work_families(collect_population(manifest, records))
+        families["source_manifest_sha256"] = sha256_file(Path(args.manifest))
+        directory = create_run_dir("work-families", config, args.output_dir)
+        write_json(directory / "work-families.json", families)
+        result = {"counts": families["counts"], "record_population_unchanged": True}
+    elif args.command == "query-check":
         from lit_harvest.query_plan import validate_plan
         plan = validate_plan(read_json(args.plan), section(config, "plan_limits"))
         result = plan["query_validation"]
@@ -549,7 +570,7 @@ def command_extension(args):
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command in {"query-check", "expand", "content-next", "content-find", "assets-resume", "evaluate"}:
+        if args.command in {"query-check", "coverage-plan", "work-families", "expand", "content-next", "content-find", "assets-resume", "evaluate"}:
             return command_extension(args)
         if args.command in {"discover", "content", "screen", "reading-pack", "reading-receipt", "reading-next"}:
             return command_research(args)

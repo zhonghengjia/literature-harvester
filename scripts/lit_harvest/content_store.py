@@ -54,12 +54,48 @@ def cached_pdf_document(path, record, *, cache_dir="", **options):
     return doc
 
 
-def load_document(path):
-    path = Path(path).resolve()
-    doc = json.loads(path.read_text(encoding="utf-8"))
+def verify_document_sources(doc, *, allow_unread_asset_recovery=False):
+    """Check both the article and every derived object before offering text."""
     source = Path(doc["source"]["artifact"])
     if not source.is_file() or sha256_file(source) != doc.get("source_sha256"):
         raise ValueError("Document source is missing or changed")
+    checked = {}
+    by_id = {e["id"]: e for e in doc["elements"]}
+    derived_paths = {e["object_source"]["artifact"] for e in doc["elements"] if e.get("object_source")}
+    for element in doc["elements"]:
+        for asset in element.get("assets", []):
+            if asset.get("status") != "acquired_not_interpreted":
+                continue
+            if allow_unread_asset_recovery and asset.get("path") not in derived_paths:
+                continue
+            path = Path(asset.get("path", ""))
+            key = str(path.resolve())
+            if key not in checked:
+                checked[key] = sha256_file(path) if path.is_file() else None
+            if not asset.get("sha256") or checked[key] != asset["sha256"]:
+                raise ValueError("Linked object source is missing or changed")
+    for element in doc["elements"]:
+        binding = element.get("object_source")
+        if not binding:
+            continue
+        parent = by_id.get(binding.get("declared_by_element_id"), {})
+        if binding.get("parent_source_sha256") != doc["source_sha256"] or not any(
+                a.get("sha256") == binding.get("sha256") and a.get("path") == binding.get("artifact")
+                and a.get("declared_reference") == binding.get("declaration", {}).get("href")
+                for a in parent.get("assets", [])):
+            raise ValueError("Linked object declaration is missing or changed")
+        path = Path(binding["artifact"])
+        key = str(path.resolve())
+        if key not in checked:
+            checked[key] = sha256_file(path) if path.is_file() else None
+        if checked[key] != binding.get("sha256"):
+            raise ValueError("Linked object source is missing or changed")
+
+
+def load_document(path, *, allow_unread_asset_recovery=False):
+    path = Path(path).resolve()
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    verify_document_sources(doc, allow_unread_asset_recovery=allow_unread_asset_recovery)
     return doc, sha256_file(path)
 
 

@@ -242,7 +242,16 @@ class PaperRecord:
         for hit in other.extra.get("discovery_hits") or []:
             if hit not in discovery_hits:
                 discovery_hits.append(hit)
+        relation_evidence = {}
+        for key in ("version_relations", "declared_links"):
+            combined = list(self.extra.get(key) or [])
+            for item in other.extra.get(key) or []:
+                if item not in combined:
+                    combined.append(item)
+            if combined:
+                relation_evidence[key] = combined
         self.extra.update({key: value for key, value in other.extra.items() if value not in (None, "")})
+        self.extra.update(relation_evidence)
         if provider_aliases:
             self.extra["provider_id_aliases"] = provider_aliases
         if discovery_hits:

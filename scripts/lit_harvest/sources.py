@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
-import html
+from html.parser import HTMLParser
+import hashlib
+import json
 import re
 import shlex
 from difflib import SequenceMatcher
@@ -236,10 +238,34 @@ def detect_identifier(query: str) -> tuple[str, str]:
     return "text", query
 
 
+class _MetadataText(HTMLParser):
+    """Tokenize metadata markup without treating numeric comparisons as tags."""
+    _BLOCKS = {"p", "div", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6",
+               "li", "ul", "ol", "table", "tr", "td", "th", "section", "title"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        if tag.casefold() in self._BLOCKS:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag.casefold() in self._BLOCKS:
+            self.parts.append(" ")
+
+
 def _strip_tags(value: str | None) -> str:
     if not value:
         return ""
-    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value)).split())
+    parser = _MetadataText()
+    parser.feed(value)
+    parser.close()
+    return " ".join("".join(parser.parts).split())
 
 
 def _year_from_parts(value: Any) -> int | None:
@@ -260,84 +286,113 @@ def _element_text(node: ElementTree.Element | None) -> str:
     return " ".join("".join(node.itertext()).split())
 
 
-def _parse_pubmed_xml(raw: bytes, limit: int) -> list[PaperRecord]:
+def _pubmed_authors(node):
+    """Direct authors only: a chapter must not silently inherit its book editors."""
+    names = []
+    if node is not None:
+        for group in node.findall("AuthorList"):
+            if group.get("Type", "authors").casefold() != "authors":
+                continue
+            for author in group.findall("Author"):
+                name = _element_text(author.find("CollectiveName")) or " ".join(filter(None, (
+                    _element_text(author.find("ForeName")) or _element_text(author.find("Initials")),
+                    _element_text(author.find("LastName")), _element_text(author.find("Suffix")),
+                )))
+                if name:
+                    names.append(name)
+    return names
+
+
+def _pubmed_record(item, rank, limit):
+    book_record = item.tag == "PubmedBookArticle"
+    citation = item.find("BookDocument" if book_record else "MedlineCitation")
+    article = citation if book_record else citation.find("Article") if citation is not None else None
+    if article is None:
+        raise ValueError("Missing PubMed article/document")
+    book = article.find("Book") if book_record else None
+    chapter_title = _element_text(article.find("ArticleTitle"))
+    book_title = _element_text(book.find("BookTitle")) if book is not None else ""
+    title = chapter_title or book_title
+    if not title:
+        raise ValueError("Missing PubMed title")
+    authors = _pubmed_authors(article)
+    if book_record and not chapter_title:
+        authors = authors or _pubmed_authors(book)
+    abstract_parts = []
+    for node in article.findall("./Abstract/AbstractText"):
+        text, label = _element_text(node), (node.get("Label") or "").strip()
+        if text:
+            abstract_parts.append(f"{label}: {text}" if label else text)
+    date = book.find("PubDate") if book is not None else article.find("./Journal/JournalIssue/PubDate")
+    year_text = ((_element_text(date.find("Year")) or _element_text(date.find("MedlineDate")))
+                 if date is not None else "") or _element_text(article.find("./ArticleDate/Year"))
+    year = re.search(r"\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b", year_text)
+    identifiers = {}
+    data_name = "PubmedBookData" if book_record else "PubmedData"
+    id_nodes = article.findall("./ArticleIdList/ArticleId") + item.findall(f"./{data_name}/ArticleIdList/ArticleId")
+    for node in id_nodes:
+        kind, value = (node.get("IdType") or "").casefold(), _element_text(node)
+        if kind and value:
+            identifiers[kind] = value
+    # Book-level DOI belongs to the book, not automatically to an indexed chapter.
+    location_parent = book if book_record and not chapter_title else article
+    for node in location_parent.findall("ELocationID") if location_parent is not None else []:
+        if (node.get("EIdType") or "").casefold() == "doi":
+            identifiers.setdefault("doi", _element_text(node))
+    types = article.findall("PublicationType") if book_record else article.findall("./PublicationTypeList/PublicationType")
+    publication_types = [_element_text(n).casefold() for n in types if _element_text(n)]
+    pmid = _pmid(_element_text(citation.find("PMID")) or identifiers.get("pubmed"))
+    extra = {"volume": _element_text(article.find("./Journal/JournalIssue/Volume")),
+             "issue": _element_text(article.find("./Journal/JournalIssue/Issue")),
+             "pages": _element_text(article.find("Pagination/MedlinePgn")),
+             "publication_types": publication_types, "pubmed_record_type": item.tag,
+             "pubmed_identifiers": identifiers}
+    if book is not None:
+        extra.update({"book_title": book_title, "book_authors": _pubmed_authors(book),
+                      "publisher": _element_text(book.find("./Publisher/PublisherName")),
+                      "publisher_place": _element_text(book.find("./Publisher/PublisherLocation")),
+                      "isbn": [_element_text(n) for n in book.findall("Isbn") if _element_text(n)],
+                      "edition": _element_text(book.find("Edition")),
+                      "collection_title": _element_text(book.find("CollectionTitle")),
+                      "book_doi": next((_element_text(n) for n in book.findall("ELocationID")
+                                        if (n.get("EIdType") or "").casefold() == "doi"), "")})
+        accession = identifiers.get("bookaccession", "")
+        if re.fullmatch(r"NBK\d+", accession):
+            extra["declared_links"] = [{"url": f"https://www.ncbi.nlm.nih.gov/books/{accession}/",
+                                        "source_field": "BookDocument/ArticleIdList/bookaccession",
+                                        "kind": "bookshelf_landing"}]
+    record = PaperRecord(title=title, authors=authors, year=int(year.group(0)) if year else None,
+        journal=_element_text(article.find("./Journal/Title")), abstract="\n".join(abstract_parts),
+        doi=identifiers.get("doi", ""), pmid=pmid, pmcid=identifiers.get("pmc", ""),
+        url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+        item_type=("bookSection" if chapter_title else "book") if book_record else
+                  ("preprint" if any("preprint" in p for p in publication_types) else "journalArticle"),
+        sources=["pubmed"], relevance_score=_score(rank, limit), extra=extra)
+    _add_pmc_cloud(record)
+    return record
+
+
+def _parse_pubmed_xml(raw: bytes, limit: int, *, status=None) -> list[PaperRecord]:
+    """Keep the list API; optional shared diagnostics describe every metadata row.
+
+    PubMed's DTD allows interleaved journal and book records. ElementTree does not
+    fetch the external DTD; malformed whole XML remains a page error.
+    """
     root = ElementTree.fromstring(raw)
-    records: list[PaperRecord] = []
-    for rank, item in enumerate(root.findall(".//PubmedArticle")):
+    records = []
+    diagnostics = status if status is not None else {}
+    for item in root.iter():
+        if item.tag not in {"PubmedArticle", "PubmedBookArticle"}:
+            continue
         if len(records) >= limit:
             break
-        citation = item.find("MedlineCitation")
-        article = citation.find("Article") if citation is not None else None
-        if citation is None or article is None:
-            continue
-        title = _element_text(article.find("ArticleTitle"))
-        if not title:
-            continue
-        authors: list[str] = []
-        for author in article.findall("./AuthorList/Author"):
-            collective = _element_text(author.find("CollectiveName"))
-            name = collective or " ".join(
-                value
-                for value in (
-                    _element_text(author.find("ForeName")),
-                    _element_text(author.find("LastName")),
-                )
-                if value
-            )
-            if name:
-                authors.append(name)
-        abstract_parts: list[str] = []
-        for node in article.findall("./Abstract/AbstractText"):
-            text = _element_text(node)
-            label = (node.attrib.get("Label") or "").strip()
-            if text:
-                abstract_parts.append(f"{label}: {text}" if label else text)
-
-        pub_date = article.find("./Journal/JournalIssue/PubDate")
-        year_text = _element_text(pub_date.find("Year")) if pub_date is not None else ""
-        if not year_text and pub_date is not None:
-            year_text = _element_text(pub_date.find("MedlineDate"))
-        if not year_text:
-            year_text = _element_text(article.find("./ArticleDate/Year"))
-        year_match = re.search(r"\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b", year_text)
-
-        identifiers: dict[str, str] = {}
-        for node in item.findall("./PubmedData/ArticleIdList/ArticleId"):
-            id_type = (node.attrib.get("IdType") or "").casefold()
-            value = _element_text(node)
-            if id_type and value:
-                identifiers[id_type] = value
-        for node in article.findall("ELocationID"):
-            if (node.attrib.get("EIdType") or "").casefold() == "doi":
-                identifiers.setdefault("doi", _element_text(node))
-
-        publication_types = [
-            _element_text(node).casefold()
-            for node in article.findall("./PublicationTypeList/PublicationType")
-        ]
-        pmid = _element_text(citation.find("PMID"))
-        record = PaperRecord(
-            title=title,
-            authors=authors,
-            year=int(year_match.group(0)) if year_match else None,
-            journal=_element_text(article.find("./Journal/Title")),
-            abstract="\n".join(abstract_parts),
-            doi=identifiers.get("doi", ""),
-            pmid=pmid,
-            pmcid=identifiers.get("pmc", ""),
-            url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
-            item_type="preprint" if any("preprint" in value for value in publication_types) else "journalArticle",
-            sources=["pubmed"],
-            relevance_score=_score(rank, limit),
-            extra={
-                "volume": _element_text(article.find("./Journal/JournalIssue/Volume")),
-                "issue": _element_text(article.find("./Journal/JournalIssue/Issue")),
-                "pages": _element_text(article.find("Pagination/MedlinePgn")),
-                "publication_types": publication_types,
-            },
-        )
-        _add_pmc_cloud(record)
-        records.append(record)
+        rank = diagnostics.get("raw_rows", 0)
+        pmid_node = item.find("./BookDocument/PMID" if item.tag == "PubmedBookArticle" else "./MedlineCitation/PMID")
+        pmid = _pmid(_element_text(pmid_node))
+        if pmid:
+            diagnostics.setdefault("returned_ids", []).append(pmid)
+        with _record_guard(diagnostics, rank):
+            records.append(_pubmed_record(item, rank, limit))
     return records
 
 
@@ -454,19 +509,75 @@ def search_pubmed(
                 status["exhausted"] = True
                 break
     records: list[PaperRecord] = []
+    status.update({"raw_rows": 0, "requested_ids": list(ids), "returned_ids": []})
     for start in range(0, len(ids), 100):
         params = {**common, "id": ",".join(ids[start:start + 100]), "retmode": "xml"}
         url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + urlencode(params)
         try:
             with pacer.slot(interval):
                 with client.request(url, headers={"Accept": "application/xml"}) as response:
-                    records.extend(_parse_pubmed_xml(_read_xml_response(response, client), limit - len(records)))
+                    records.extend(_parse_pubmed_xml(_read_xml_response(response, client), limit - len(records), status=status))
         except Exception as exc:
             _page_error(status, exc, len(records), {"efetch_start": start})
             break
+    parsed_ids = {record.pmid for record in records if record.pmid}
+    status["parsed_ids"] = [record.pmid for record in records if record.pmid]
+    status["missing_requested_ids"] = [ident for ident in ids if ident not in parsed_ids]
+    status["missing_response_ids"] = [ident for ident in ids if ident not in status["returned_ids"]]
+    status["unexpected_response_ids"] = sorted(set(status["returned_ids"]) - set(ids))
+    if status["missing_requested_ids"]:
+        status["errors"].append("Requested PubMed identifiers missing from parsed records; see missing_requested_ids")
     if status["errors"]:
         status["status"] = "partial" if records else "error"
     return _finish_search(records, status)
+
+
+def _retain_version_metadata(record, item, source):
+    """Preserve provider assertions, never infer versions from comments or titles."""
+    digest = hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":")).encode("utf-8")).hexdigest()
+    source_id = (f"doi:{record.doi}" if record.doi else f"pmid:{record.pmid}" if record.pmid else
+                 f"europe_pmc:{item.get('source', '')}:{item.get('id', '')}")
+    evidence = (f"https://api.crossref.org/works/{quote(record.doi, safe='')}" if source == "crossref"
+                else "https://www.ebi.ac.uk/europepmc/webservices/rest/" +
+                quote(str(item.get("source", "")), safe="") + "/" + quote(str(item.get("id", "")), safe="") +
+                "?format=json&resultType=core")
+    relations = []
+    def add(relation, target, target_type, raw):
+        if isinstance(target, str) and target.strip() and isinstance(target_type, str):
+            relations.append({"relation": relation, "target_id": target.strip(), "target_id_type": target_type,
+                              "source": source, "source_record_id": source_id, "evidence_url": evidence,
+                              "source_metadata_sha256": digest, "raw_relation": raw})
+    if source == "crossref":
+        raw = item.get("relation")
+        if raw is not None:
+            record.extra["provider_relations"] = raw
+        if isinstance(raw, dict):
+            for relation, entries in raw.items():
+                if not isinstance(relation, str) or not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        add(relation.casefold().replace("_", "-"), entry.get("id"), entry.get("id-type"), entry)
+    else:
+        versions = item.get("versionList")
+        if versions is not None:
+            record.extra["provider_version_list"] = versions
+        if item.get("commentCorrectionList") is not None:
+            record.extra["provider_comment_corrections"] = item["commentCorrectionList"]
+        entries = versions.get("version", []) if isinstance(versions, dict) else []
+        if item.get("source") == "PPR" and isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                target_source, target = entry.get("source"), entry.get("id")
+                # Official versionList describes versions of the same preprint,
+                # not journal publication links. Ignore the usual self entry.
+                if (target_source == "PPR" and isinstance(target, str) and target
+                        and (target_source, target) != (item.get("source"), item.get("id"))):
+                    add("is-version-of", f"{target_source}:{target}", "europe_pmc", entry)
+    if relations:
+        record.extra["version_relations"] = relations
 
 
 def search_crossref(client: HttpClient, query: str, limit: int, contact_email: str = "") -> list[PaperRecord]:
@@ -522,6 +633,7 @@ def search_crossref(client: HttpClient, query: str, limit: int, contact_email: s
                     "publication_types": _publication_types(item.get("type")),
                 },
             )
+            _retain_version_metadata(record, item, "crossref")
             if verified_oa_license:
                 for link in item.get("link") or []:
                     if link.get("content-type") == "application/pdf":
@@ -579,6 +691,7 @@ def search_europe_pmc(client: HttpClient, query: str, limit: int) -> list[PaperR
                 relevance_score=_score(rank, limit),
                 extra={"publication_types": _publication_types((item.get("pubTypeList") or {}).get("pubType"))},
             )
+            _retain_version_metadata(record, item, "europe_pmc")
             full_text_urls = (item.get("fullTextUrlList") or {}).get("fullTextUrl", [])
             for candidate in full_text_urls:
                 if (str(candidate.get("documentStyle", "")).lower() == "pdf"

@@ -10,6 +10,7 @@ from urllib.parse import quote
 from .coverage import write_coverage
 from .models import PaperRecord
 from .outcomes import collect_population, summarize_outcomes, is_verified_pdf, article_type
+from .work_families import build_work_families
 
 
 def _md(value: Any) -> str:
@@ -28,6 +29,7 @@ def _bib_escape(value: str) -> str:
 def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRecord]) -> None:
     records = collect_population(manifest, records)
     metrics = summarize_outcomes(records, manifest.get("settings", {}).get("target_pdfs"))
+    family_counts = build_work_families(records)["counts"]
     run_dir.mkdir(parents=True, exist_ok=True)
     fields = [
         "title",
@@ -49,6 +51,10 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
         "duplicate_of",
         "retry_at",
         "article_type",
+        "item_type",
+        "book_title",
+        "publisher",
+        "isbn",
         "local_pdf",
         "local_fulltext",
         "fulltext_format",
@@ -64,6 +70,8 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
         for record in records:
             row = record.to_dict()
             row["article_type"] = article_type(record)
+            row.update({k: record.extra.get(k, "") for k in ("book_title", "publisher")})
+            row["isbn"] = "; ".join(record.extra.get("isbn", []))
             row["authors"] = "; ".join(record.authors)
             row["sources"] = "; ".join(record.sources)
             writer.writerow({field: row.get(field, "") for field in fields})
@@ -79,6 +87,8 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
         "",
         f"- Run ID: `{manifest.get('run_id', '')}`",
         f"- Records: {len(records)}",
+        f"- Version-family view (records are not deleted): {family_counts}",
+        "- High-confidence metadata families are provisional; neither family count nor record count certifies independent studies.",
         f"- PDFs available locally: {downloaded}",
         f"- JATS-derived readable Markdown (not PDFs): {fulltext_only}",
         "",
@@ -114,7 +124,7 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
 
     bib_entries: list[str] = []
     for index, record in enumerate(records, 1):
-        entry_type = "article" if record.item_type == "journalArticle" else "misc"
+        entry_type = {"journalArticle": "article", "bookSection": "incollection", "book": "book"}.get(record.item_type, "misc")
         values = {
             "title": record.title,
             "author": " and ".join(record.authors),
@@ -122,6 +132,9 @@ def write_reports(run_dir: Path, manifest: dict[str, Any], records: list[PaperRe
             "journal": record.journal,
             "doi": record.doi,
             "url": record.url,
+            "booktitle": record.extra.get("book_title", "") if record.item_type == "bookSection" else "",
+            "publisher": record.extra.get("publisher", "") if record.item_type in {"book", "bookSection"} else "",
+            "isbn": "; ".join(record.extra.get("isbn", [])),
         }
         body = ",\n".join(
             f"  {key} = {{{_bib_escape(value)}}}" for key, value in values.items() if value
