@@ -14,10 +14,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from decimal import Decimal
 import hashlib
 import json
 import re
 from typing import Any, Iterable, Mapping
+import unicodedata
 from urllib.parse import urlparse
 
 from .models import PaperRecord, normalize_doi, normalize_pmid, normalize_pmcid, normalize_arxiv_id, normalize_title, normalize_work_alias
@@ -25,7 +27,7 @@ from .query_plan import candidate_id
 
 
 SCHEMA_VERSION = 1
-ALGORITHM_VERSION = "work-families-0.8.0-v1"
+ALGORITHM_VERSION = "work-families-0.9.0-v1"
 VERSION_RELATIONS = frozenset({"is-preprint-of", "has-preprint", "is-version-of", "has-version", "is-manuscript-of", "has-manuscript"})
 NON_VERSION_RELATIONS = frozenset({
     "is-translation-of", "has-translation", "is-comment-on", "has-comment",
@@ -163,6 +165,7 @@ def _authors(a: _Member, b: _Member) -> dict[str, Any]:
     first = bool(left and right and left[0].intersection(right[0]))
     compatible = bool(minimum and overlap / minimum >= .6 and (overlap >= 2 or minimum == 1 and first))
     return {"matched_authors": overlap, "shorter_author_count": minimum, "first_author_compatible": first,
+            "longer_author_count": max(len(left), len(right)),
             "compatible": compatible, "known_disjoint": bool(left and right and not overlap)}
 
 
@@ -171,7 +174,14 @@ def _shingles(words: list[str], length: int) -> set[tuple[str, ...]]:
 
 
 def _abstracts(a: _Member, b: _Member) -> dict[str, Any]:
-    aa, bb = (normalize_title(m.record.abstract).split() for m in (a, b))
+    def words(member: _Member) -> list[str]:
+        text = _clinical_text(member.record.abstract)
+        # Equivalent decimal/range typography is not a substantive disagreement.
+        # Full effects and CIs are still compared separately, without tolerance.
+        text = re.sub(r"(?<![\w.])[0-9]+(?:\.[0-9]+)?(?![\w.])", lambda m: _number(m.group()), text)
+        text = re.sub(r"(?<=[0-9])\s+to\s+(?=[0-9])", "-", text, flags=re.I)
+        return normalize_title(text).split()
+    aa, bb = words(a), words(b)
     sa, sb = set(aa), set(bb)
     five_a, five_b = _shingles(aa, 5), _shingles(bb, 5)
     shared = five_a & five_b
@@ -200,29 +210,226 @@ def _abstracts(a: _Member, b: _Member) -> dict[str, Any]:
             "strong": strong}
 
 
+def _number(value: str) -> str:
+    return format(Decimal(value.replace(",", "")).normalize(), "f")
+
+
+def _clinical_text(value: str) -> str:
+    # Keep decimal points and comparison operators: normalize_title intentionally
+    # discards them and cannot safely identify an effect/CI/stratum tuple.
+    text = unicodedata.normalize("NFKC", value)
+    return text.replace("≥", ">=").replace("≤", "<=").replace("–", "-").replace("−", "-").replace("—", "-")
+
+
+def _cohort_fingerprint(abstract: str) -> dict[str, Any]:
+    text = _clinical_text(abstract).casefold()
+    methods = re.search(r"\bmethods?\b[\s:.]*(.*?)(?=\bresults?\b|\bconclusions?\b|\Z)", text, re.S)
+    scope = methods.group(1) if methods else text
+    total = set()
+    for pattern in (
+        r"\b(?:a\s+)?total\s+(?:of\s+)?([0-9][0-9,]*)\s+(?:patients|participants|subjects|children|adults|individuals|records|cases)\b",
+        r"\b(?:enrolled|included|recruited|involving)\s+(?:a\s+total\s+of\s+)?([0-9][0-9,]*)\s+(?:patients|participants|subjects|children|adults|individuals)\b",
+        r"\b([0-9][0-9,]*)\s+(?:patients|participants|subjects|children|adults|individuals)\s+were\s+(?:included|enrolled|recruited|analy[sz]ed)\b",
+        r"\b(?:total|overall|cohort|sample(?:\s+size)?)\s*(?:\(\s*)?(?:n\s*)?[=:]\s*([0-9][0-9,]*)\b",
+    ):
+        total.update(_number(v) for v in re.findall(pattern, text))
+    populations = {}
+    for dimension, labels in {
+        "age": {"pediatric": r"\b(?:p[ae]ediatric|pediatric|children|child)\b", "adult": r"\badults?\b",
+                "neonatal": r"\b(?:neonat\w*|newborns?)\b"},
+        "species": {"mouse": r"\b(?:mice|mouse|murine)\b", "rat": r"\b(?:rats?|rodent)\b"},
+        "design": {"retrospective": r"\bretrospective\b", "prospective": r"\bprospective\b"},
+    }.items():
+        populations[dimension] = sorted(label for label, pattern in labels.items() if re.search(pattern, scope))
+    conditions = []
+    for match in re.finditer(r"\b(?:patients|participants|subjects|children|adults)\s+(?:diagnosed\s+)?(?:with|undergoing|admitted\s+for)\s+(.{3,120}?)(?=\s+(?:from|between|during|who|were)\b|[.;,]|$)", scope):
+        tokens = set(normalize_title(match.group(1)).split()) - STOP_WORDS
+        if tokens:
+            conditions.append(sorted(tokens))
+    windows = sorted({tuple(v) for v in re.findall(r"\b(?:between|from|during)\s+((?:19|20)[0-9]{2})\s*(?:and|to|-)\s*((?:19|20)[0-9]{2})\b", scope)})
+    return {"explicit_total_n": sorted(total), "population_terms": populations,
+            "cohort_conditions": sorted(conditions), "recruitment_year_windows": windows,
+            "trial_ids": sorted(set(re.findall(r"\b(?:nct[0-9]{8}|isrctn[0-9]{8}|actrn[0-9]{14})\b", text)))}
+
+
+def _result_groups(abstract: str) -> list[dict[str, Any]]:
+    text = _clinical_text(abstract)
+    scalar = r"[-+]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)"
+    pattern = re.compile(r"(?P<point>" + scalar + r")\s*[,;(\[]\s*(?:\(\s*)?95\s*%\s*(?:CI|confidence\s+interval)\s*[:=]?\s*[\[(]?\s*(?P<low>" + scalar + r")\s*(?:-|to)\s*(?P<high>" + scalar + r")", re.I)
+    labels = re.compile(r"\b(?:OR|HR|RR|IRR|SMD|MD)\b|\b(?i:(?:odds|hazard|risk|rate)\s+ratios?|(?:standardized\s+)?mean\s+differences?)\b")
+    strata = re.compile(r"\b([a-z][a-z0-9_-]*)(?:\s+(?:was|is|levels?))?\s*(>=|<=|>|<|=)\s*(" + scalar + r")", re.I)
+    ignore = STOP_WORDS | frozenset("adjusted odds hazard ratio risk confidence interval patients participants values value received receiving treatment significantly increased decreased higher lower ci or hr rr p mmol when whereas those both either overall similarly similar findings observed total".split())
+    groups = []
+    for match in pattern.finditer(text):
+        preceding = text[max(0, match.start() - 500):match.start()]
+        label_matches = list(labels.finditer(preceding[-160:]))
+        if not label_matches:
+            continue
+        label = label_matches[-1].group().casefold()
+        label = {"odds ratio": "or", "odds ratios": "or", "hazard ratio": "hr", "hazard ratios": "hr",
+                 "risk ratio": "rr", "risk ratios": "rr", "rate ratio": "irr", "rate ratios": "irr",
+                 "mean difference": "md", "mean differences": "md", "standardized mean difference": "smd"}.get(label, label)
+        point, low, high = (_number(match.group(key)) for key in ("point", "low", "high"))
+        if Decimal(low) > Decimal(high) or not Decimal(low) <= Decimal(point) <= Decimal(high):
+            continue
+        # P values, sample-size and effect labels are not population strata.
+        stratum_matches = [m for m in strata.finditer(preceding)
+                           if m.group(1).casefold() not in {"p", "or", "hr", "rr", "irr", "ci", "n"}]
+        stratum = list(stratum_matches[-1].groups()) if stratum_matches else []
+        if stratum:
+            stratum = [stratum[0].casefold(), stratum[1], _number(stratum[2])]
+        start = text.rfind(" ", 0, max(0, match.start() - 320)) + 1
+        end = text.find(" ", min(len(text), match.end() + 65))
+        context = text[start:end if end >= 0 else len(text)]
+        tokens = {w for w in normalize_title(context).split() if w not in ignore and len(w) >= 4 and not w.isdigit()}
+        groups.append({"statistic": label, "point": point, "ci95": [low, high],
+                       "stratum": stratum, "context_tokens": sorted(tokens),
+                       "abstract_span": [match.start(), match.end()]})
+    return groups
+
+
+def _clinical_fingerprint(a: _Member, b: _Member) -> dict[str, Any]:
+    cohorts = [_cohort_fingerprint(m.record.abstract) for m in (a, b)]
+    groups = [_result_groups(m.record.abstract) for m in (a, b)]
+    conflicts = []
+    for field in ("explicit_total_n", "trial_ids", "recruitment_year_windows"):
+        left, right = cohorts[0][field], cohorts[1][field]
+        if left and right and left != right:
+            conflicts.append({"field": field, "observations": [left, right]})
+    for dimension in ("age", "species", "design"):
+        left, right = (cohort["population_terms"][dimension] for cohort in cohorts)
+        if left and right and left != right:
+            conflicts.append({"field": "population_" + dimension, "observations": [left, right]})
+    conditions = [cohort["cohort_conditions"] for cohort in cohorts]
+    if all(conditions) and not any(len(set(left) & set(right)) / min(len(left), len(right)) >= .5
+                                   for left in conditions[0] for right in conditions[1]):
+        conflicts.append({"field": "cohort_condition", "observations": conditions})
+    def signature(group):
+        return (group["statistic"], group["point"], *group["ci95"])
+    scoped = [defaultdict(set), defaultdict(set)]
+    for index, entries in enumerate(groups):
+        for entry in entries:
+            if entry["stratum"]:
+                scoped[index][(entry["statistic"], *entry["stratum"])].add(signature(entry))
+    for key in sorted(set(scoped[0]) & set(scoped[1])):
+        if not scoped[0][key] & scoped[1][key]:
+            conflicts.append({"field": "stratified_effect_ci", "scope": list(key),
+                              "observations": [sorted(scoped[0][key]), sorted(scoped[1][key])]})
+    shared = {}
+    for left in groups[0]:
+        for right in groups[1]:
+            if signature(left) != signature(right):
+                continue
+            if left["stratum"] and right["stratum"] and left["stratum"] != right["stratum"]:
+                continue
+            lt, rt = set(left["context_tokens"]), set(right["context_tokens"])
+            common = lt & rt
+            if len(common) < 4 or len(common) / min(len(lt), len(rt)) < .4:
+                continue
+            key = signature(left)
+            shared.setdefault(key, {"statistic": key[0], "point": key[1], "ci95": list(key[2:]),
+                                    "shared_context_tokens": sorted(common),
+                                    "strata": [left["stratum"], right["stratum"]],
+                                    "abstract_spans": [left["abstract_span"], right["abstract_span"]]})
+    n = [cohort["explicit_total_n"] for cohort in cohorts]
+    return {"cohorts": cohorts, "result_groups": groups,
+            "sample_size_status": "explicit_conflict" if n[0] and n[1] and n[0] != n[1] else
+                                  "both_explicit_equal" if all(n) else "missing_on_one_or_both_sides_not_confirmed",
+            "shared_result_group_count": len(shared), "shared_result_groups": [shared[k] for k in sorted(shared)],
+            "conflicts": conflicts, "strong": len(shared) >= 2 and not conflicts}
+
+
+def _title_evidence(a: _Member, b: _Member) -> dict[str, Any]:
+    aa, bb = (set(m.record.normalized_title.split()) - STOP_WORDS for m in (a, b))
+    shared = aa & bb
+    specific = all(len(words) >= 6 and len(m.record.normalized_title) >= 45 for words, m in ((aa, a), (bb, b)))
+    containment = len(shared) / min(len(aa), len(bb)) if aa and bb else 0.0
+    return {"shared_tokens": len(shared), "token_containment": round(containment, 6),
+            "both_specific": specific, "candidate": specific and len(shared) >= 4 and containment >= .6}
+
+
+def _metadata_candidates(ids: list[str], members: dict[str, _Member]) -> list[tuple[str, str]]:
+    titles: dict[str, list[str]] = defaultdict(list)
+    author_blocks: dict[tuple[str, str], set[str]] = defaultdict(set)
+    pairs = set()
+    for cid in ids:
+        member = members[cid]
+        if member.record.normalized_title:
+            titles[member.record.normalized_title].append(cid)
+        for author in member.record.authors:
+            for key in _author_keys(author):
+                author_blocks[key].add(cid)
+    for group in titles.values():
+        pairs.update((cid, other) for i, cid in enumerate(group) for other in group[i + 1:])
+    checked = set(pairs)
+    for group in author_blocks.values():
+        ordered = sorted(group)
+        for i, cid in enumerate(ordered):
+            for other in ordered[i + 1:]:
+                pair = (cid, other)
+                if pair in checked:
+                    continue
+                checked.add(pair)
+                a, b = members[cid], members[other]
+                if {a.role, b.role} != {"preprint", "journal"} or a.record.year is None or b.record.year is None or abs(a.record.year - b.record.year) > 4:
+                    continue
+                titles_match = _title_evidence(a, b)["candidate"]
+                abstracts = _abstracts(a, b) if not titles_match else {}
+                # Blocking only generates candidates. It never grants a family:
+                # sparse authors, missing abstracts and numerical conflicts still
+                # reach the more conservative checks below and remain review.
+                if titles_match or (abstracts.get("shared_fivegrams", 0) >= 10 and
+                                    abstracts.get("distinctive_shared_tokens", 0) >= 20 and
+                                    abstracts.get("token_containment", 0) >= .55):
+                    pairs.add(pair)
+    return sorted(pairs)
+
+
 def _metadata(a: _Member, b: _Member) -> dict[str, Any]:
     title_equal = bool(a.record.normalized_title and a.record.normalized_title == b.record.normalized_title)
     title_tokens = set(a.record.normalized_title.split()) - STOP_WORDS
     title_specific = len(title_tokens) >= 6 and len(a.record.normalized_title) >= 45
     authors = _authors(a, b)
     abstracts = _abstracts(a, b)
+    clinical = _clinical_fingerprint(a, b)
+    titles = _title_evidence(a, b)
     year_ok = bool(a.record.year is not None and b.record.year is not None and abs(a.record.year - b.record.year) <= 4)
     roles_ok = {a.role, b.role} == {"preprint", "journal"}
     chronology_ok = year_ok
     if roles_ok and year_ok:
         preprint, journal = (a, b) if a.role == "preprint" else (b, a)
         chronology_ok = preprint.record.year <= journal.record.year + 1
+    strict_authors = (authors["compatible"] and authors["matched_authors"] >= 2 and
+                      authors["matched_authors"] / authors["shorter_author_count"] >= .8 and
+                      authors["matched_authors"] / authors["longer_author_count"] >= .5)
+    spread = abstracts["shared_fivegram_coverage_by_third"]
+    edited_abstract = (min(abstracts["word_counts"]) >= 100 and abstracts["shared_fivegrams"] >= 20 and
+                       abstracts["distinctive_shared_tokens"] >= 25 and abstracts["token_containment"] >= .65 and
+                       abstracts["fivegram_dice"] >= .2 and all(sum(v >= .1 for v in thirds) >= 2 for thirds in spread))
+    changed_title_support = (titles["both_specific"] and strict_authors and edited_abstract and clinical["strong"])
+    title_and_abstract_support = (title_specific and abstracts["strong"] if title_equal else changed_title_support)
+    pairwise_support = bool(not a.restrictions and not b.restrictions and authors["compatible"] and
+                            chronology_ok and title_and_abstract_support and not clinical["conflicts"])
     reasons = []
     for ok, reason in ((not a.restrictions and not b.restrictions, "separate_related_work"),
-                       (title_equal, "title_not_equal"), (title_specific, "generic_title"),
+                       (title_specific if title_equal else titles["both_specific"], "generic_title"),
                        (authors["compatible"], "insufficient_author_evidence"),
                        (chronology_ok, "incompatible_or_missing_years"),
-                       (roles_ok, "not_preprint_journal_pair"), (abstracts["strong"], "insufficient_distinctive_abstract")):
+                       (roles_ok, "not_preprint_journal_pair"),
+                       (abstracts["strong"] if title_equal else edited_abstract, "insufficient_distinctive_abstract"),
+                       (not clinical["conflicts"], "conflicting_cohort_or_result_evidence")):
         if not ok:
             reasons.append(reason)
+    if not title_equal:
+        if not strict_authors:
+            reasons.append("insufficient_changed_title_author_evidence")
+        if not clinical["strong"]:
+            reasons.append("insufficient_independent_result_fingerprints")
     return {"title_equal": title_equal, "title_specific": title_specific, "authors": authors,
-            "abstracts": abstracts, "chronology_compatible": chronology_ok, "roles": [a.role, b.role],
-            "reasons": reasons, "high_confidence": not reasons}
+            "title_evidence": titles, "abstracts": abstracts, "clinical_fingerprint": clinical,
+            "metadata_method": "exact_title" if title_equal else "changed_title_multievidence",
+            "chronology_compatible": chronology_ok, "roles": [a.role, b.role],
+            "pairwise_support": pairwise_support, "reasons": reasons, "high_confidence": not reasons}
 
 
 def _components(ids: list[str], edges: Iterable[tuple[str, str]]) -> list[list[str]]:
@@ -265,8 +472,7 @@ def _conflicts(group: list[str], members: dict[str, _Member], negative: set[froz
                     reason = "multiple_unlinked_journal_versions"
                 elif evidence["authors"]["known_disjoint"] and not evidence["title_equal"]:
                     reason = "incompatible_bridge_metadata"
-                elif metadata_layer and not (evidence["title_equal"] and evidence["authors"]["compatible"] and
-                                             evidence["abstracts"]["strong"] and evidence["chronology_compatible"]):
+                elif metadata_layer and not evidence["pairwise_support"]:
                     reason = "metadata_bridge_not_pairwise_supported"
             if reason:
                 conflicts.append({"candidate_ids": sorted(pair), "reason": reason})
@@ -390,30 +596,26 @@ def build_work_families(records: Iterable[PaperRecord | Mapping[str, Any]]) -> d
     accepted = [e for e in relations if e["status"] == "accepted"]
     confirmed_components = _components(ids, [(e["subject_candidate_id"], e["object_candidate_id"]) for e in accepted])
     confirmed_group_for = {cid: tuple(group) for group in confirmed_components for cid in group}
-    # Title is a candidate generator, never a merge key. Only the fully checked
-    # evidence below can create the separate metadata layer.
-    titles: dict[str, list[str]] = defaultdict(list)
-    for cid in ids:
-        if members[cid].record.normalized_title:
-            titles[members[cid].record.normalized_title].append(cid)
+    # Exact title and author/year/role blocks are candidate generators, never
+    # merge keys. Changed titles require their own independent result evidence.
     metadata_edges = []
-    for group in titles.values():
-        for i, cid in enumerate(group):
-            for other in group[i + 1:]:
-                if confirmed_group_for[cid] == confirmed_group_for[other]:
-                    continue
-                evidence = _metadata(members[cid], members[other])
-                conflicted = cid in provider_conflicted_ids or other in provider_conflicted_ids
-                if evidence["high_confidence"] and frozenset((cid, other)) not in negative and not conflicted:
-                    edge = {"subject_candidate_id": cid, "object_candidate_id": other,
-                            "relation": "possible-version-of", "source": "local_metadata", "basis": "high_confidence_metadata",
-                            "status": "proposed", "reason": "", "evidence": evidence,
-                            "source_record_sha256": [members[cid].metadata_sha256, members[other].metadata_sha256]}
-                    edge["relation_id"] = "wr_" + _digest(edge)[:24]
-                    metadata_edges.append(edge)
-                else:
-                    review.append({"candidate_ids": [cid, other], "reason": "conflicting_provider_component" if conflicted else "same_title_insufficient_version_evidence",
-                                   "evidence": evidence})
+    for cid, other in _metadata_candidates(ids, members):
+        if confirmed_group_for[cid] == confirmed_group_for[other]:
+            continue
+        evidence = _metadata(members[cid], members[other])
+        conflicted = cid in provider_conflicted_ids or other in provider_conflicted_ids
+        negative_pair = frozenset((cid, other)) in negative
+        if evidence["high_confidence"] and not negative_pair and not conflicted:
+            edge = {"subject_candidate_id": cid, "object_candidate_id": other,
+                    "relation": "possible-version-of", "source": "local_metadata", "basis": "high_confidence_metadata",
+                    "status": "proposed", "reason": "", "evidence": evidence,
+                    "source_record_sha256": [members[cid].metadata_sha256, members[other].metadata_sha256]}
+            edge["relation_id"] = "wr_" + _digest(edge)[:24]
+            metadata_edges.append(edge)
+        else:
+            reason = ("conflicting_provider_component" if conflicted else "explicit_non_version_relation" if negative_pair else
+                      "same_title_insufficient_version_evidence" if evidence["title_equal"] else "changed_title_insufficient_version_evidence")
+            review.append({"candidate_ids": [cid, other], "reason": reason, "evidence": evidence})
     # A metadata bridge may not weaken a confirmed component's protections.
     quarantine(accepted + metadata_edges, True)
     for edge in metadata_edges:

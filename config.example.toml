@@ -38,6 +38,12 @@ max_retry_wait = 30
 body_timeout_seconds = 90
 ca_file = ""
 
+[discovery]
+# Preserve original topic queries and quotas, then append complementary routes.
+# Unsupported/restricted queries are kept unchanged with a visible planning reason.
+additive_default = true
+additional_per_source = 50
+
 [content]
 batch_size = 25
 # Zero processes the whole selected population/all pages.

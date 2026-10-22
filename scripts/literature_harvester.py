@@ -52,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--article-type", action="append", choices=sorted(ARTICLE_TYPES), default=[])
     discover.add_argument("--output-dir", required=True)
     discover.add_argument("--download", action="store_true", help="Also run the existing permitted PDF acquisition for the selected queue")
+    discover.add_argument("--original-only", action="store_true", help="Execute only the original plan without default complementary routes")
     _common_config(discover)
     content = subparsers.add_parser("content", help="Prepare source-linked article content without modifying the frozen manifest or PDF metrics")
     content.add_argument("--manifest", required=True)
@@ -178,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
     _common_config(ingest)
     for name, help_text in {
         "query-check": "Conservative syntax diagnostics; not a completeness certificate",
-        "coverage-plan": "Prepare a reviewable complementary query strategy at a fixed per-source result budget",
+        "coverage-plan": "Preserve original routes and add complementary search, or explicitly prepare a fixed-budget experiment",
         "work-families": "Non-destructive version families; retain every original record and DOI",
         "expand": "One-hop citation child run with resumable page state",
         "content-next": "Extract only unprocessed PDF pages into a new document",
@@ -193,6 +194,8 @@ def build_parser() -> argparse.ArgumentParser:
             extension.add_argument("--plan", required=True)
             if name == "coverage-plan":
                 extension.add_argument("--per-source-budget", type=int, default=100)
+                extension.add_argument("--mode", choices=["additive", "fixed-budget"], default="additive")
+                extension.add_argument("--additional-per-source", type=int, help="Additive slots per supported source; default comes from discovery settings (50)")
         elif name == "work-families":
             extension.add_argument("--manifest", required=True)
         elif name == "expand":
@@ -265,15 +268,18 @@ def command_research(args: argparse.Namespace) -> int:
     from lit_harvest.query_plan import validate_plan
     config = load_config(args.config)
     if args.command == "discover":
-        plan = validate_plan(read_json(args.plan), section(config, "plan_limits"))
+        plan = read_json(args.plan)
+        validate_plan(plan, section(config, "plan_limits"))
         directory, manifest, records = run_pipeline(plan["question"], config, args.queue_size,
-            args.output_dir, args.download, article_types=args.article_type, query_plan=plan)
+            args.output_dir, args.download, article_types=args.article_type, query_plan=plan,
+            original_only=getattr(args, "original_only", False))
         write_reports(directory, manifest, records)
         states = manifest["source_status"]
         result = {"run_dir": str(directory), "manifest": str(directory / "manifest.json"),
                   "selected_records": len(records), "candidate_records": len(records.candidates),
                   "source_status": states, "research_context": manifest["research_context"]}
-        failed = any(states[r["id"]]["status"] in {"error", "partial", "disabled"} for r in plan["routes"])
+        executed = read_json(manifest["research_context"]["query-plan.json"]["path"])
+        failed = any(states[r["id"]]["status"] in {"error", "partial", "disabled"} for r in executed["routes"])
     elif args.command == "content":
         if args.cache_dir is not None:
             config.setdefault("content", {})["cache_dir"] = args.cache_dir
@@ -515,7 +521,10 @@ def command_extension(args):
     failed = False
     if args.command == "coverage-plan":
         from lit_harvest.coverage_plan import build_coverage_plan
-        result = build_coverage_plan(read_json(args.plan), args.per_source_budget)
+        result = build_coverage_plan(read_json(args.plan), args.per_source_budget, mode=args.mode,
+            additional_per_source=(args.additional_per_source if args.additional_per_source is not None else
+                                   section(config, "discovery")["additional_per_source"]),
+            limits=section(config, "plan_limits"))
         directory = create_run_dir("coverage-plan", config, args.output_dir)
         write_json(directory / "coverage-plan.json", result)
         write_json(directory / "query-plan.json", result["query_plan"])

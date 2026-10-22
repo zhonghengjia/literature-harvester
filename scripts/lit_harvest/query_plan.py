@@ -23,7 +23,7 @@ def _keys(value, allowed, name):
 
 
 def validate_plan(plan, limits=None):
-    _keys(plan, {"schema_version", "question", "scope_note", "concepts", "routes", "limits", "query_validation"}, "query plan")
+    _keys(plan, {"schema_version", "question", "scope_note", "concepts", "routes", "limits", "query_validation", "coverage"}, "query plan")
     supplied = plan.get("limits", {})
     _keys(supplied, set(DEFAULT_CONFIG["plan_limits"]), "plan limits")
     bounds = {**DEFAULT_CONFIG["plan_limits"], **(limits or {}), **supplied}
@@ -83,8 +83,6 @@ def validate_plan(plan, limits=None):
         ids = item.get("concept_ids", [])
         if not isinstance(ids, list) or any(not isinstance(i, str) or i not in by_id for i in ids) or len(set(ids)) != len(ids):
             raise ValueError("Route concept_ids must refer to unique declared concepts")
-        if item.get("query") and ids:
-            raise ValueError("Use an explicit query or concept_ids, not both")
         if ids:
             if source not in NATIVE:
                 raise ValueError("Concept compilation supports PubMed, Europe PMC and arXiv; provide text queries for other sources")
@@ -99,12 +97,18 @@ def validate_plan(plan, limits=None):
                     alternatives += [f'"{h["term"]}"[MeSH Terms]' for h in by_id[ident].get("mesh_terms", [])]
                 groups.append("(" + " OR ".join(alternatives) + ")")
             query = " AND ".join(groups)
+            # Normalized plans retain their concept subset. A supplied compiled
+            # query is allowed only if it is exactly that same compilation.
+            if item.get("query") and (_text(item["query"], "query", bounds["text_chars"]) != query
+                                      or syntax != "native"):
+                raise ValueError("A route with query and concept_ids must match the exact native concept compilation")
             syntax = "native"
         else:
             query = _text(item.get("query"), "query", bounds["text_chars"])
         if syntax == "native" and source not in NATIVE:
             raise ValueError("Native syntax is not supported for this source")
-        compiled.append({"id": route_id, "source": source, "query": query, "syntax": syntax, "limit": limit})
+        compiled.append({"id": route_id, "source": source, "query": query, "syntax": syntax, "limit": limit,
+                         **({"concept_ids": list(ids)} if ids else {})})
     if len({r["id"] for r in compiled}) != len(compiled) or sum(r["limit"] for r in compiled) > bounds["total_records"]:
         raise ValueError("Route ids must be unique and total candidates within configured plan budget")
     normalized = {"schema_version": 1, "question": question, "concepts": concepts, "routes": compiled}
@@ -116,6 +120,9 @@ def validate_plan(plan, limits=None):
     bad = [r for r in normalized["query_validation"]["routes"] if r["errors"]]
     if bad:
         raise ValueError("Query syntax error in route " + bad[0]["route_id"] + ": " + str(bad[0]["errors"]))
+    if "coverage" in plan:
+        from .coverage_plan import validate_coverage_marker
+        normalized["coverage"] = validate_coverage_marker(plan["coverage"], normalized, limits)
     return normalized
 
 

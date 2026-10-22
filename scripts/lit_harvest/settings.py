@@ -15,6 +15,7 @@ DEFAULT_CONFIG = {
                   "pmc_versions": 1000},
     "search": {"workers": 5, "max_records": 100000, "preprint_candidates": 25,
                "core_candidates": 50, "supplemental_candidates": 25},
+    "discovery": {"additive_default": True, "additional_per_source": 50},
     "plan_limits": {"concepts": 100, "terms": 100, "routes": 100,
                     "route_records": 100000, "total_records": 100000,
                     "text_chars": 50000, "term_chars": 1000},

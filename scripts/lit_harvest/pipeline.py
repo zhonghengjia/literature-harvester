@@ -1,5 +1,6 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -218,7 +219,39 @@ def search_all(query, config, max_results, env=None, *, required_terms=None, art
     route_order = {r["id"]: index for index, r in enumerate(routes)}
     all_records.sort(key=lambda r: (min((METADATA_SOURCE_PRIORITY.get(s, 99) for s in r.sources), default=99),
         min((route_order[h["route_id"]] for h in r.extra.get("discovery_hits", [])), default=0) if plan else 0))
-    merged = merge_records(all_records, ranking="routes")
+    coverage = plan.get("coverage") if plan else None
+    original_mapping = []
+    if coverage and coverage["mode"] == "additive":
+        original_route_ids = {r["route_id"] for r in coverage["route_strategies"] if r["strategy"] == "original"}
+        original_rows, additional_rows = [], []
+        for record in all_records:
+            target = original_rows if any(h["route_id"] in original_route_ids for h in record.extra.get("discovery_hits", [])) else additional_rows
+            target.append(record)
+        # Establish IDs before append metadata can supplement identifiers,
+        # authors, or screening; original conflicting records stay separate.
+        originals = merge_records(original_rows, ranking="routes")
+        pinned = {}
+        seen_original_ids = set()
+        for record in originals:
+            cid = record.extra.get("candidate_id", candidate_id(record))
+            if not isinstance(cid, str) or not cid.strip() or cid in seen_original_ids:
+                raise ValueError("Original candidate IDs must be nonempty unique strings")
+            seen_original_ids.add(cid)
+            record.extra["candidate_id"] = cid
+            pinned[id(record)] = (cid, deepcopy(record.extra.get("screening")))
+        merged = merge_records(originals + additional_rows, ranking="routes")
+        for record in merged:
+            if id(record) in pinned:
+                cid, screening = pinned[id(record)]
+                regenerated = candidate_id(record)
+                record.extra["candidate_id"] = cid
+                if screening is not None:
+                    record.extra["screening"] = screening
+                original_mapping.append({"original_candidate_id": cid, "merged_candidate_id": cid,
+                    "metadata_candidate_id_after_append": regenerated, "original_route_ids": sorted({h["route_id"] for h in record.extra.get("discovery_hits", [])} & original_route_ids),
+                    "identity_keys_after_append": record.identity_keys})
+    else:
+        merged = merge_records(all_records, ranking="routes")
     eligible = filter_required_terms(merged, required_terms)
     if article_types:
         if set(article_types) - ARTICLE_TYPES:
@@ -228,12 +261,16 @@ def search_all(query, config, max_results, env=None, *, required_terms=None, art
     records = eligible[:max_results]
     eligible_ids = {id(r) for r in eligible}
     for record in merged:
-        record.extra["candidate_id"] = candidate_id(record)
+        if not (coverage and coverage["mode"] == "additive") or id(record) not in pinned:
+            record.extra["candidate_id"] = candidate_id(record)
         record.extra["concept_evidence"] = concept_evidence(record, plan["concepts"] if plan else [])
-        record.extra["screening"] = {"decision": "uncertain", "reason": "Not yet reviewed against the research question", "actor": "system", "at": utc_now()}
+        if not (coverage and coverage["mode"] == "additive" and id(record) in pinned and pinned[id(record)][1] is not None):
+            record.extra["screening"] = {"decision": "uncertain", "reason": "Not yet reviewed against the research question", "actor": "system", "at": utc_now()}
         record.extra["queue_eligible"] = id(record) in eligible_ids
         if id(record) not in eligible_ids:
             record.extra["queue_exclusion_reason"] = "Explicit requested metadata/literal filter; candidate retained"
+    if len({r.extra["candidate_id"] for r in merged}) != len(merged):
+        raise ValueError("Merged inventory candidate IDs are not unique")
     records = SelectedRecords(records, merged)
     statuses["selection"] = {"raw_records": len(all_records), "deduplicated_records": len(merged),
         "eligible_records": len(eligible), "selected_records": len(records), "source_candidate_limit": source_limit,
@@ -241,6 +278,10 @@ def search_all(query, config, max_results, env=None, *, required_terms=None, art
     if plan:
         statuses["selection"]["source_candidate_limit"] = None
         statuses["selection"]["route_candidate_limits"] = {r["id"]: r["limit"] for r in routes}
+        if coverage:
+            statuses["selection"]["coverage_planning"] = {k: coverage[k] for k in
+                ("mode", "experiment_type", "original_plan_sha256", "budgets", "route_strategies", "skipped_routes")}
+            statuses["selection"]["original_candidate_mapping"] = original_mapping
     content = config.get("openalex_content", {})
     client = make_client(config)
     result = enrich_openalex_content(client, records, env.get("OPENALEX_API_KEY", ""),
@@ -272,7 +313,7 @@ def load_manifest(path):
         raise ValueError("Unsupported or invalid manifest schema")
     context = manifest.get("research_context")
     if context:
-        for name in ("query-plan.json", "candidates.json", *(["work-families.json"] if "work-families.json" in context else [])):
+        for name in ("query-plan.json", "candidates.json", *[name for name in ("work-families.json", "coverage-plan.json") if name in context]):
             ref = context.get(name, {})
             source = Path(ref.get("path", ""))
             if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != ref.get("sha256"):
@@ -374,13 +415,26 @@ def retrieve_population(run_dir, manifest, records, config, env):
     checkpoint()
 
 def run_pipeline(query, config, max_results, output_dir, download, target_pdfs=None,
-                 required_terms=None, env=None, *, article_types=None, max_candidates=None, query_plan=None):
+                 required_terms=None, env=None, *, article_types=None, max_candidates=None, query_plan=None, original_only=False):
     cap = positive(section(config, "search")["max_records"], "search.max_records")
     if not 1 <= max_results <= cap or (max_candidates is not None and not max_results <= max_candidates <= cap):
         raise ValueError(f"Candidate limits must satisfy 1 <= max_results <= max_candidates <= {cap}")
     if target_pdfs is not None and (not download or not 1 <= target_pdfs <= max_results):
         raise ValueError("PDF target must be within the selected candidate cap and require downloading")
-    plan = validate_plan(query_plan, section(config, "plan_limits")) if query_plan is not None else None
+    plan = None
+    coverage_envelope = None
+    if query_plan is not None:
+        validated = validate_plan(query_plan, section(config, "plan_limits"))
+        marker = validated.get("coverage")
+        if original_only and marker:
+            plan = validate_plan(marker["original_plan"], section(config, "plan_limits"))
+        elif not original_only and section(config, "discovery")["additive_default"]:
+            from .coverage_plan import build_coverage_plan
+            coverage_envelope = build_coverage_plan(query_plan, mode="additive",
+                additional_per_source=section(config, "discovery")["additional_per_source"], limits=section(config, "plan_limits"))
+            plan = coverage_envelope["query_plan"]
+        else:
+            plan = validated
     if plan:
         query = plan["question"]
     env = dict(os.environ) if env is None else env
@@ -394,6 +448,10 @@ def run_pipeline(query, config, max_results, output_dir, download, target_pdfs=N
         "download": download, "target_pdfs": target_pdfs, "required_terms": required_terms or [],
         "article_types": article_types or [], "enabled_sources": [k for k, v in config["sources"].items() if v],
         "output_dir": str(run_dir), "effective_config": effective_settings(config)}
+    if query_plan is not None:
+        settings["discovery"] = {"original_only": bool(original_only),
+            "mode": plan.get("coverage", {}).get("mode", "original-only"),
+            "automatic_addition_requested": not original_only and section(config, "discovery")["additive_default"]}
     manifest = new_manifest(query, records, statuses, settings)
     if isinstance(records, SelectedRecords):
         if plan is None:
@@ -403,6 +461,10 @@ def run_pipeline(query, config, max_results, output_dir, download, target_pdfs=N
                 for source in SOURCE_FUNCTIONS if config["sources"].get(source, False)]}
         context = {"schema_version": 1, "ranking": "RRF k=60, one-based source rank; citation count excluded",
                    "selected_candidate_ids": [r.extra["candidate_id"] for r in records]}
+        if coverage_envelope is not None:
+            path = run_dir / "coverage-plan.json"
+            path.write_text(json.dumps(_redact(coverage_envelope, config, env), ensure_ascii=False, indent=2), encoding="utf-8")
+            context["coverage-plan.json"] = {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         for name, value in (("query-plan.json", plan), ("candidates.json", {"schema_version": 1, "records": [r.to_dict() for r in records.candidates]})):
             path = run_dir / name
             path.write_text(json.dumps(_redact(value, config, env), ensure_ascii=False, indent=2), encoding="utf-8")

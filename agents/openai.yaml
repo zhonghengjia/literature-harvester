@@ -1,4 +1,4 @@
 interface:
   display_name: "文献检索、全文阅读与 Zotero"
   short_description: "多源检索与筛选文献，获取可核验正文并准备有来源的阅读及入库"
-  default_prompt: "Use $literature-harvester to build a reproducible literature search, preserve candidates, and prepare source-linked full-text reading with explicit coverage gaps."
+  default_prompt: "Use $literature-harvester to preserve the original topic search, append complementary discovery, distinguish provisional version families, and prepare source-linked full-text reading with explicit coverage gaps."

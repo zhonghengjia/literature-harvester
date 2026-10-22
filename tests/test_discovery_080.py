@@ -115,7 +115,7 @@ class Discovery080Tests(unittest.TestCase):
     def test_coverage_immutable_fixed_budgets_and_concept_boolean(self):
         original = plan()
         before = deepcopy(original)
-        result = build_coverage_plan(original, 101)
+        result = build_coverage_plan(original, 101, mode="fixed-budget")
         self.assertEqual(original, before)
         self.assertEqual(result["original_plan"], before)
         self.assertEqual(result["experiment_type"], "same_budget_strategy_experiment")
@@ -131,23 +131,23 @@ class Discovery080Tests(unittest.TestCase):
         self.assertIn('"hyperchloremia"', routes[3]["query"])
 
     def test_normalized_exact_plan_supported_but_arbitrary_native_rejected(self):
-        self.assertEqual(len(build_coverage_plan(validate_plan(plan()))["query_plan"]["routes"]), 4)
+        self.assertEqual(len(build_coverage_plan(validate_plan(plan()), mode="fixed-budget")["query_plan"]["routes"]), 4)
         changed = plan()
         changed["routes"][0].pop("concept_ids")
         changed["routes"][0]["query"] = "chloride AND infant"
         with self.assertRaisesRegex(ValueError, "not reverse-parsed"):
-            build_coverage_plan(changed)
+            build_coverage_plan(changed, mode="fixed-budget")
         for budget in (True, 1, 0, 1.5):
-            with self.assertRaises(ValueError): build_coverage_plan(plan(), budget)
+            with self.assertRaises(ValueError): build_coverage_plan(plan(), budget, mode="fixed-budget")
 
     def test_multiple_routes_and_unsafe_atm_terms_fail_closed(self):
         original = plan()
         original["routes"].append({"id": "pm_second", "source": "pubmed", "concept_ids": ["chloride"], "limit": 10})
-        result = build_coverage_plan(original, 101)
+        result = build_coverage_plan(original, 101, mode="fixed-budget")
         self.assertEqual(sum(r["limit"] for r in result["query_plan"]["routes"] if r["source"] == "pubmed"), 101)
         original["concepts"][0]["terms"] = ["chloride OR sodium"]
         with self.assertRaisesRegex(ValueError, "plain words"):
-            build_coverage_plan(original)
+            build_coverage_plan(original, mode="fixed-budget")
 
     def test_pipeline_uses_route_quotas_without_source_recapping(self):
         from lit_harvest.pipeline import search_all
@@ -159,7 +159,7 @@ class Discovery080Tests(unittest.TestCase):
             calls.append((source, limit))
             return [PaperRecord(title=f"{source} {query}", doi=f"10.1234/{source}{limit}{len(query)}", sources=[source])]
         with patch("lit_harvest.pipeline._search_one", side_effect=search), patch("lit_harvest.pipeline.enrich_openalex_content", return_value=(0, 0, [])):
-            rows, status = search_all("chloride", config, 1, env={}, query_plan=build_coverage_plan(plan(), 101)["query_plan"])
+            rows, status = search_all("chloride", config, 1, env={}, query_plan=build_coverage_plan(plan(), 101, mode="fixed-budget")["query_plan"])
         self.assertEqual(sorted(calls), [("europe_pmc", 50), ("europe_pmc", 51), ("pubmed", 50), ("pubmed", 51)])
         self.assertEqual(status["selection"]["raw_records"], 4)
         self.assertEqual(len(rows.candidates), 4)
