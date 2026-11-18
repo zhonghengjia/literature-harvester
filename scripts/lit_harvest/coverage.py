@@ -37,7 +37,7 @@ RECOVERABLE_GUIDANCE = {
     ),
     "pmc_without_pdf": (
         "A PMC identifier exists but no PDF was retrieved. "
-        "Fall back to the Europe PMC JATS full-text XML."
+        "Resolve official PMC eligibility; try XML only if an eligible JATS object is declared."
     ),
     "oa_but_failed": (
         "A source asserted open access and supplied candidates, yet all attempts failed. "

@@ -12,7 +12,7 @@ from typing import Any, Callable
 from urllib.parse import urlencode, urlparse, urlunparse
 from uuid import uuid4
 
-from .fulltext import FullTextError, fetch_jats_url, resolve_landing_pdfs
+from .fulltext import FullTextError, fetch_jats_url, resolve_landing_pdfs, verify_declared_md5
 from .http import HttpClient, HttpError, is_web_url, redact_url
 from .identity import PdfValidationError as DownloadError, validate_pdf_structure, verify_pdf_identity
 from .models import PaperRecord, normalize_pmcid, candidate_request_key
@@ -212,9 +212,10 @@ class _TracedClient:
 
 
 def _stream_pdf_response(response: Any, part_path: Path, max_bytes: int,
-                         max_pdf_mb: int, total_timeout: int) -> bytes:
+                         max_pdf_mb: int, total_timeout: int, *, expected_md5: str = "") -> bytes:
     started, total, first_bytes = time.monotonic(), 0, b""
     read_chunk = getattr(response, "read1", None) or response.read
+    digest = hashlib.md5(usedforsecurity=False) if expected_md5 else None
     with part_path.open("wb") as handle:
         while True:
             if time.monotonic() - started > total_timeout:
@@ -230,9 +231,13 @@ def _stream_pdf_response(response: Any, part_path: Path, max_bytes: int,
             if len(first_bytes) < 4096:
                 first_bytes += chunk[:4096 - len(first_bytes)]
             handle.write(chunk)
+            if digest is not None:
+                digest.update(chunk)
     length = response.headers.get("Content-Length")
     if length and int(length) != total:
         raise HTTPException("PDF body length does not match Content-Length")
+    if digest is not None:
+        verify_declared_md5(expected_md5, digest.hexdigest())
     return first_bytes
 
 
@@ -375,7 +380,8 @@ def download_record(record: PaperRecord, pdf_dir: Path, max_pdf_mb: int = 100,
                     if length and int(length) > max_pdf_mb * 1024 * 1024:
                         raise DownloadError("too_large", f"Content-Length exceeds {max_pdf_mb} MB")
                     first_bytes = _stream_pdf_response(response, part_path, max_pdf_mb * 1024 * 1024,
-                                                       max_pdf_mb, section(config or {}, "transport")["body_timeout_seconds"])
+                                                       max_pdf_mb, section(config or {}, "transport")["body_timeout_seconds"],
+                                                       expected_md5=candidate.get("expected_md5") or "")
                 if b"%PDF-" not in first_bytes:
                     raise DownloadError("not_pdf", "Response is not a PDF")
                 result = _apply_identity(record, part_path)
@@ -406,7 +412,7 @@ def download_record(record: PaperRecord, pdf_dir: Path, max_pdf_mb: int = 100,
                 _attempt(record, candidate, "file", code, actual_url, exc, contact_email,
                          retry_at=getattr(exc, "retry_at", "") or "")
                 break
-            except (HTTPException, OSError, DownloadError, ValueError) as exc:
+            except (HTTPException, OSError, DownloadError, FullTextError, ValueError) as exc:
                 code = getattr(exc, "code", "download_failed")
                 transient = isinstance(exc, (HTTPException, TimeoutError, ConnectionError)) or (
                     isinstance(exc, OSError) and not isinstance(exc, (PermissionError, FileNotFoundError))
@@ -438,7 +444,8 @@ def download_record(record: PaperRecord, pdf_dir: Path, max_pdf_mb: int = 100,
                 if candidate_pmcid and record_pmcid and candidate_pmcid != record_pmcid:
                     raise FullTextError("JATS candidate PMCID differs from the requested article",
                                         code="identity_mismatch")
-                markdown = fetch_jats_url(client, url, record_pmcid or candidate_pmcid)
+                checksum = {"expected_md5": candidate["expected_md5"]} if candidate.get("expected_md5") else {}
+                markdown = fetch_jats_url(client, url, record_pmcid or candidate_pmcid, **checksum)
                 fulltext_dir = pdf_dir.parent / "fulltext"
                 fulltext_dir.mkdir(parents=True, exist_ok=True)
                 path = _unused_path(fulltext_dir / (Path(filename_for(record)).stem + ".fulltext.md"))
@@ -453,12 +460,13 @@ def download_record(record: PaperRecord, pdf_dir: Path, max_pdf_mb: int = 100,
                 _attempt(record, candidate, "fulltext", "fulltext_only", url)
                 return record
             except (HttpError, FullTextError, HTTPException, OSError, ValueError) as exc:
-                code = _classify_http_error(exc) if isinstance(exc, HttpError) else "fulltext_unavailable"
+                code = (_classify_http_error(exc) if isinstance(exc, HttpError) else
+                        "checksum_conflict" if getattr(exc, "code", "") == "checksum_conflict" else "fulltext_unavailable")
                 errors.append((code, str(exc)))
                 _attempt(record, candidate, "fulltext", code, url, exc, contact_email)
 
     codes = {code for code, _ in errors}
-    priority = ("manual_review", "deferred", "license_unknown", "rate_limited", "download_timeout",
+    priority = ("manual_review", "deferred", "checksum_conflict", "license_unknown", "rate_limited", "download_timeout",
                 "anti_bot", "too_large", "not_pdf", "landing_unresolved", "dead_link", "fulltext_unavailable")
     record.download_status = next((code for code in priority if code in codes), "download_failed" if errors else "no_oa_version")
     if _future(record.retry_at) and record.download_status != "manual_review":

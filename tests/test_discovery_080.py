@@ -112,6 +112,31 @@ class Discovery080Tests(unittest.TestCase):
         self.assertEqual(status["row_error_count"], 1)
         self.assertEqual(status["status"], "partial")
 
+    def test_efetch_matches_requested_pmids_even_with_unexpected_and_repeated_rows(self):
+        raw = ("<PubmedArticleSet>" + journal("99999") + BOOK + journal("10002")
+               + journal("10001") + "</PubmedArticleSet>").encode()
+        with patch("lit_harvest.sources.time.sleep"):
+            rows = search_pubmed(Client(raw, ["10001", "10002"]), "chloride", 2)
+        self.assertEqual([r.pmid for r in rows], ["10001", "10002"])
+        self.assertEqual(rows[1].item_type, "bookSection")
+        self.assertGreater(rows[0].relevance_score, rows[1].relevance_score)
+        status = rows.source_status
+        self.assertEqual(status["unexpected_response_ids"], ["99999"])
+        self.assertEqual(status["duplicate_response_ids"], ["10002"])
+        self.assertEqual(status["missing_requested_ids"], [])
+        self.assertEqual(status["skipped_rows"], 2)
+        self.assertEqual(status["status"], "partial")
+
+    def test_short_esearch_page_before_provider_total_stays_partial(self):
+        raw = ("<PubmedArticleSet>" + journal() + "</PubmedArticleSet>").encode()
+        client = Client(raw, ["10001"])
+        with patch.object(client, "get_json", return_value={
+                "esearchresult": {"count": "3", "idlist": ["10001"]}}):
+            rows = search_pubmed(client, "chloride", 3)
+        self.assertEqual([r.pmid for r in rows], ["10001"])
+        self.assertEqual(rows.source_status["status"], "partial")
+        self.assertFalse(rows.source_status["exhausted"])
+
     def test_coverage_immutable_fixed_budgets_and_concept_boolean(self):
         original = plan()
         before = deepcopy(original)

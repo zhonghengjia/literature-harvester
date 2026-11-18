@@ -6,7 +6,7 @@ The manifest is the source of truth for a frozen run. New runs use schema_versio
 
 - run_id, query, created_at, updated_at identify a run.
 - settings holds non-secret source choices, selected/pre-filter candidate caps, explicit filters, PDF target and output folder. On resume, enabled_sources reflects the current configuration used for retrieval; the frozen discovery history remains in source_status and the unchanged parent manifest. Resume never repeats discovery.
-- source_status retains source errors, partial-page counts, continuation hints and content blocked/disabled states. JSON adapters report raw_rows, parsed_rows, skipped_rows and bounded row_errors so a malformed metadata row does not erase valid peers. PubMed nonempty query errorlist is error/partial, not successful exhaustion; query_trace retains the details. query_diagnostics preserves submitted route syntax without rewriting it. Semantic Scholar discloses effective_mode (identifier/relevance/bulk), submitted_query and rank_semantics. A continuation hint is diagnostic; resume does not repeat discovery.
+- source_status retains source errors, partial-page counts, continuation hints and content blocked/disabled states. JSON adapters report raw_rows, parsed_rows, skipped_rows and bounded row_errors so a malformed metadata row does not erase valid peers. PubMed EFetch accepts each requested PMID once per batch and restores ESearch order. Missing, unexpected and duplicate PMIDs and short pages before the reported total are reported as partial or error. PubMed query errorlist is error/partial; query_trace retains the details. query_diagnostics preserves submitted route syntax without rewriting it. Semantic Scholar discloses effective_mode (identifier/relevance/bulk), submitted_query and rank_semantics. A continuation hint is diagnostic; resume does not repeat discovery.
 - records contains the entire selected pool: successes, failures, deferred and pending records. New runs never move failures out of this array.
 - A schema 1 download_attempts array is merged into the population without dropping conflicting identifiers; duplicate legacy outcomes are retained as record history. Resuming creates a fresh schema 2 run, parent_run_id and parent_manifest_sha256, leaving the source manifest unchanged.
 - attempts records candidate/actual request URLs, source, stage, outcome, errors and deadlines. Resolver warnings and per-record fallback_sources remain available in candidate metadata/extra.
@@ -26,7 +26,7 @@ local_pdf, sha256, download_source, download_url, download_version and retrieval
 
 ## Record statuses
 
-pending; downloaded; already_downloaded; fulltext_only; duplicate_pdf; deferred; manual_review; rejected_source; no_oa_version; rate_limited; anti_bot; dead_link; not_pdf; too_large; license_unknown; download_timeout; download_failed; landing_unresolved; fulltext_unavailable.
+pending; downloaded; already_downloaded; fulltext_only; duplicate_pdf; deferred; manual_review; rejected_source; no_oa_version; rate_limited; anti_bot; dead_link; not_pdf; too_large; license_unknown; download_timeout; download_failed; landing_unresolved; fulltext_unavailable; checksum_conflict.
 
 Legacy status strings remain readable. A failure means the attempted routes did not provide an accepted PDF, not proof that no lawful route exists. A fulltext_only record can have a PDF that failed elsewhere; it does not establish that no PDF object exists.
 

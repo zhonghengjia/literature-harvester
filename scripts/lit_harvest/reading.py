@@ -12,7 +12,7 @@ from .article_document import jats_document, render_document, element_reading_te
 from .content_store import cached_pdf_document as pdf_document, verify_document_sources
 from .html_document import html_document
 from .downloader import user_agent, sha256_file, _safe_message, download_record
-from .fulltext import _fetch_bounded, MAX_XML_BYTES, FullTextError
+from .fulltext import _fetch_bounded, MAX_XML_BYTES, FullTextError, verify_declared_md5
 from .http import HttpClient, is_web_url, redact_url, host_deferrals, restore_host_deferrals
 from .models import PaperRecord, candidate_request_key
 from .pmc import resolve_pmc_candidates, BUCKET_HOST, is_pmc_listing_candidate
@@ -147,8 +147,8 @@ def acquire_document(record, directory, config, env, *, local_only=False, local_
             seen.add(candidate["url"])
             try:
                 raw, actual, _ = _fetch_bounded(client, candidate["url"], resources["xml_bytes"], "application/xml")
-                if candidate.get("expected_md5") and hashlib.md5(raw).hexdigest() != candidate["expected_md5"]:
-                    raise FullTextError("PMC object checksum mismatch", code="checksum_conflict")
+                if expected_md5 := candidate.get("expected_md5"):
+                    verify_declared_md5(expected_md5, hashlib.md5(raw, usedforsecurity=False).hexdigest())
                 doc = jats_document(raw, clone, max_bytes=resources["xml_bytes"])
                 raw_path = directory / "source.xml"
                 with raw_path.open("xb") as stream:

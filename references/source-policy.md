@@ -12,7 +12,7 @@ Read before live discovery or download work. Free official/OA routes are the def
 - PubMed/Europe PMC/OpenAlex PMCID records register an official PMC Cloud resolver. Matching identity, license/access eligibility, declared object and official bucket path are required. Retraction is separate: a permitted retracted article remains readable with an explicit warning and cannot be treated as active evidence. Unknown retraction status is also labeled. A non-OA author manuscript with explicit TDM eligibility is text-only: retrieve its declared JATS, not arbitrary PDF/media objects.
 - Official Europe PMC JATS may be used only when article OA eligibility is established. A bare PMCID alone is not that eligibility. The generated prose reader is not a lossless PDF substitute.
 
-Use the current pmc-oa-opendata Cloud metadata contract, not retired FTP/OA Web Service routes or bulk HTML scraping. PMC version number is deposit-processing order, not proof of the published version. Preserve per-version warnings rather than hiding alternate-version failures.
+Use the current pmc-oa-opendata Cloud metadata contract. PMC version number records deposit-processing order. When metadata declares an object MD5, check the fetched PDF or JATS bytes before committing a file or deriving text. A mismatch records `checksum_conflict` and leaves other eligible candidates available. Preserve per-version warnings and verify article identity as a separate check.
 
 ## Ordering and fallback
 

@@ -11,6 +11,13 @@ SOURCES = {"pubmed", "europe_pmc", "crossref", "openalex", "semantic_scholar", "
 NATIVE = {"pubmed", "europe_pmc", "arxiv"}
 
 
+class QuerySyntaxError(ValueError):
+    def __init__(self, diagnostics):
+        self.diagnostics = diagnostics
+        first = next(route for route in diagnostics["routes"] if route["errors"])
+        super().__init__(f"Query syntax error in route {first['route_id']}: {first['errors']}")
+
+
 def _text(value, name, limit=50000):
     if not isinstance(value, str) or not value.strip() or len(value) > limit or any(ord(c) < 32 and c not in '\r\n\t' for c in value):
         raise ValueError(f"Invalid {name}")
@@ -117,9 +124,8 @@ def validate_plan(plan, limits=None):
         normalized["scope_note"] = _text(plan["scope_note"], "scope note", bounds["text_chars"])
     from .query_lint import inspect_plan
     normalized["query_validation"] = inspect_plan(normalized)
-    bad = [r for r in normalized["query_validation"]["routes"] if r["errors"]]
-    if bad:
-        raise ValueError("Query syntax error in route " + bad[0]["route_id"] + ": " + str(bad[0]["errors"]))
+    if any(r["errors"] for r in normalized["query_validation"]["routes"]):
+        raise QuerySyntaxError(normalized["query_validation"])
     if "coverage" in plan:
         from .coverage_plan import validate_coverage_marker
         normalized["coverage"] = validate_coverage_marker(plan["coverage"], normalized, limits)

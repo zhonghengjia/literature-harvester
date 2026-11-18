@@ -1,7 +1,7 @@
 """Conservative syntax diagnostics, not a clinical search-validity certificate."""
 import re
 
-VERSION = "query-lint/2"
+VERSION = "query-lint/3"
 FIELDS = {
     "pubmed": {"ti", "ab", "tiab", "title", "abstract", "title/abstract", "mh", "mesh", "mesh terms", "majr", "mesh major topic", "pt", "publication type", "au", "author", "ad", "affiliation", "dp", "date - publication", "pdat", "edat", "uid", "pmid", "all fields", "tw", "text word", "la", "language", "jour", "journal", "issn", "sb", "filter"},
     "europe_pmc": {"TITLE", "ABSTRACT", "TITLE_ABS", "AUTH_FIRST", "AUTH_LAST", "AUTH_MANUSCRIPT", "AUTHORID", "AUTH_ORCID", "AUTHOR", "JOURNAL", "EXT_ID", "SRC", "DOI", "PMCID", "PUB_YEAR", "FIRST_PDATE", "CREATION_DATE", "MESH", "PUB_TYPE", "OPEN_ACCESS", "HAS_FT", "IN_PMC"},
@@ -56,9 +56,10 @@ def inspect_query(query, source, syntax="native"):
         key = field.casefold().split(":")[0] if source == "pubmed" else field
         if key not in FIELDS.get(source, set()):
             warnings.append({"code": "field_requires_provider_verification", "field": field, "offset": match.start()})
-    for match in re.finditer(r"\b(AND|OR|NOT|ANDNOT)\s*$", plain):
-        # Quoted trailing terms were masked; examine original suffix before flagging.
-        if not query[match.start()+len(match.group(1)):].strip():
+    for match in re.finditer(r"(?<![^\s(])(AND|OR|NOT|ANDNOT)(?!\w)", plain):
+        # Quoted terms are masked for scanning, but remain real operands.
+        suffix = query[match.end():].lstrip()
+        if not suffix or suffix.startswith(")"):
             errors.append({"code": "trailing_boolean_operator", "offset": match.start()})
     result["status"] = "error" if errors else "warnings" if warnings else "checked_subset"
     return result

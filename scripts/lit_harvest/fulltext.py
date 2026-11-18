@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from html.parser import HTMLParser
 import copy
+import hashlib
 import re
 from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -245,13 +246,24 @@ def jats_to_markdown(raw: bytes, expected_pmcid: str = "", *, max_bytes=MAX_XML_
     return "\n".join(lines).strip() + "\n"
 
 
-def fetch_jats_url(client: HttpClient, url: str, pmcid: str) -> str:
+def verify_declared_md5(expected: str, observed: str) -> None:
+    """Compare a provider-declared object digest, independent of article identity."""
+    if expected and (not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", expected)):
+        raise FullTextError("Declared PMC object checksum is invalid", code="checksum_conflict")
+    if expected and expected.casefold() != observed:
+        raise FullTextError(f"PMC object checksum mismatch (expected {expected}, received {observed})",
+                            code="checksum_conflict")
+
+
+def fetch_jats_url(client: HttpClient, url: str, pmcid: str, *, expected_md5: str = "") -> str:
     """Fetch a caller-authorized JATS candidate and verify its PMCID."""
     normalized = normalize_pmcid(pmcid)
     if not normalized:
         raise FullTextError("Not a usable PMCID", code="invalid_identifier")
     limit = resource_limit(client, "xml_bytes")
     raw, _, _ = _fetch_bounded(client, url, limit, "application/xml")
+    if expected_md5:
+        verify_declared_md5(expected_md5, hashlib.md5(raw, usedforsecurity=False).hexdigest())
     return jats_to_markdown(raw, expected_pmcid=normalized, max_bytes=limit)
 
 

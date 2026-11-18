@@ -179,6 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
     _common_config(ingest)
     for name, help_text in {
         "query-check": "Conservative syntax diagnostics; not a completeness certificate",
+        "run-check": "Check a frozen run and optional content index offline",
         "coverage-plan": "Preserve original routes and add complementary search, or explicitly prepare a fixed-budget experiment",
         "work-families": "Non-destructive version families; retain every original record and DOI",
         "expand": "One-hop citation child run with resumable page state",
@@ -196,8 +197,10 @@ def build_parser() -> argparse.ArgumentParser:
                 extension.add_argument("--per-source-budget", type=int, default=100)
                 extension.add_argument("--mode", choices=["additive", "fixed-budget"], default="additive")
                 extension.add_argument("--additional-per-source", type=int, help="Additive slots per supported source; default comes from discovery settings (50)")
-        elif name == "work-families":
+        elif name in {"work-families", "run-check"}:
             extension.add_argument("--manifest", required=True)
+            if name == "run-check":
+                extension.add_argument("--content-index")
         elif name == "expand":
             extension.add_argument("--manifest", required=True)
             extension.add_argument("--seed", action="append", required=True, dest="seeds")
@@ -538,11 +541,34 @@ def command_extension(args):
         write_json(directory / "work-families.json", families)
         result = {"counts": families["counts"], "record_population_unchanged": True}
     elif args.command == "query-check":
-        from lit_harvest.query_plan import validate_plan
-        plan = validate_plan(read_json(args.plan), section(config, "plan_limits"))
-        result = plan["query_validation"]
+        from lit_harvest.query_plan import QuerySyntaxError, validate_plan
+        try:
+            plan = validate_plan(read_json(args.plan), section(config, "plan_limits"))
+            result = plan["query_validation"]
+        except QuerySyntaxError as exc:
+            result = exc.diagnostics
+            failed = True
+        except ValueError as exc:
+            result = {"schema_version": 1, "routes": [], "plan_error": str(exc),
+                      "scientific_completeness_verified": False}
+            failed = True
         directory = create_run_dir("query-check", config, args.output_dir)
         write_json(directory / "query-validation.json", result)
+    elif args.command == "run-check":
+        from lit_harvest.run_check import check_run
+        try:
+            report = check_run(args.manifest, args.content_index)
+            result = {key: report[key] for key in ("selected_records", "discovered_records",
+                "outside_selected_queue", "search_status_counts", "pdf_status_counts", "content_status_counts")}
+            failed = (bool({"changed_pdf", "missing_pdf", "unreadable_pdf"} & report["pdf_status_counts"].keys())
+                      or "content_integrity_error" in report["content_status_counts"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            report = {"schema_version": 1, "status": "input_error", "error": str(exc)}
+            result = report
+            failed = True
+        directory = create_run_dir("run-check", config, args.output_dir)
+        write_json(directory / "run-check.json", report)
+        result = {"report": str(directory / "run-check.json"), **result}
     elif args.command == "expand":
         from lit_harvest.relations import expand
         directory, manifest = expand(args.manifest, args.output_dir, config, seeds=args.seeds,
@@ -579,7 +605,7 @@ def command_extension(args):
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command in {"query-check", "coverage-plan", "work-families", "expand", "content-next", "content-find", "assets-resume", "evaluate"}:
+        if args.command in {"query-check", "run-check", "coverage-plan", "work-families", "expand", "content-next", "content-find", "assets-resume", "evaluate"}:
             return command_extension(args)
         if args.command in {"discover", "content", "screen", "reading-pack", "reading-receipt", "reading-next"}:
             return command_research(args)

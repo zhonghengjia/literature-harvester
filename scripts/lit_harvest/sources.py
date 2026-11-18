@@ -372,7 +372,7 @@ def _pubmed_record(item, rank, limit):
     return record
 
 
-def _parse_pubmed_xml(raw: bytes, limit: int, *, status=None) -> list[PaperRecord]:
+def _parse_pubmed_xml(raw: bytes, limit: int, *, status=None, requested_ids=None) -> list[PaperRecord]:
     """Keep the list API; optional shared diagnostics describe every metadata row.
 
     PubMed's DTD allows interleaved journal and book records. ElementTree does not
@@ -381,6 +381,9 @@ def _parse_pubmed_xml(raw: bytes, limit: int, *, status=None) -> list[PaperRecor
     root = ElementTree.fromstring(raw)
     records = []
     diagnostics = status if status is not None else {}
+    expected = set(requested_ids) if requested_ids is not None else None
+    accepted = {}
+    returned = set()
     for item in root.iter():
         if item.tag not in {"PubmedArticle", "PubmedBookArticle"}:
             continue
@@ -392,7 +395,21 @@ def _parse_pubmed_xml(raw: bytes, limit: int, *, status=None) -> list[PaperRecor
         if pmid:
             diagnostics.setdefault("returned_ids", []).append(pmid)
         with _record_guard(diagnostics, rank):
-            records.append(_pubmed_record(item, rank, limit))
+            if expected is None:
+                records.append(_pubmed_record(item, rank, limit))
+                continue
+            if not pmid:
+                raise ValueError("PubMed EFetch row has no primary PMID")
+            if pmid not in expected:
+                diagnostics.setdefault("unexpected_response_ids", []).append(pmid)
+                continue
+            if pmid in returned:
+                diagnostics.setdefault("duplicate_response_ids", []).append(pmid)
+            returned.add(pmid)
+            if pmid not in accepted:
+                accepted[pmid] = _pubmed_record(item, rank, limit)
+    if expected is not None:
+        return [accepted[pmid] for pmid in requested_ids if pmid in accepted]
     return records
 
 
@@ -439,7 +456,9 @@ def _pubmed_partitioned_ids(client, term, limit, common, pacer, interval, status
                 normalized = [_pmid(v) for v in batch]
                 if any(not v or not low <= int(v) <= high for v in normalized):
                     raise ValueError("PubMed returned an identifier outside its partition")
-                unique = [v for v in normalized if v not in seen]
+                unique = list(dict.fromkeys(v for v in normalized if v not in seen))
+                if len(unique) != len(normalized):
+                    status["errors"].append("PubMed partition returned repeated identifiers")
                 if not unique:
                     raise ValueError("PubMed repeated a partition page")
                 seen.update(unique)
@@ -491,32 +510,39 @@ def search_pubmed(
                     raise ValueError("PubMed rejected the query; inspect query_trace errorlist")
                 if not isinstance(result.get("idlist"), list):
                     raise ValueError("PubMed returned no idlist")
-                batch = [_pmid(item) for item in result["idlist"] if _pmid(item)]
+                raw_batch = [_pmid(item) for item in result["idlist"]]
             except Exception as exc:
                 _page_error(status, exc, len(ids), start)
                 break
             status["pages"] += 1
-            new_ids = [item for item in batch if item not in ids]
+            known_ids = set(ids)
+            new_ids = list(dict.fromkeys(item for item in raw_batch if item and item not in known_ids))
+            if len(new_ids) != len(raw_batch):
+                status["errors"].append("PubMed ESearch returned duplicate or invalid identifiers")
             ids.extend(new_ids[:limit - len(ids)])
-            if not batch or len(batch) < size:
-                status["exhausted"] = True
-                break
-            if not new_ids:
+            if raw_batch and not new_ids:
                 _page_error(status, ValueError("PubMed repeated a page"), len(ids), start)
                 break
-            start += len(batch)
-            if str(result.get("count", "")).isdigit() and start >= int(result["count"]):
+            start += len(raw_batch)
+            count = result.get("count")
+            at_end = str(count).isdigit() and start >= int(count)
+            if len(raw_batch) < size and str(count).isdigit() and not at_end:
+                _page_error(status, ValueError("PubMed returned a short page before its reported total"), len(ids), start)
+                break
+            if len(raw_batch) < size or at_end:
                 status["exhausted"] = True
                 break
     records: list[PaperRecord] = []
     status.update({"raw_rows": 0, "requested_ids": list(ids), "returned_ids": []})
     for start in range(0, len(ids), 100):
-        params = {**common, "id": ",".join(ids[start:start + 100]), "retmode": "xml"}
+        requested = ids[start:start + 100]
+        params = {**common, "id": ",".join(requested), "retmode": "xml"}
         url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + urlencode(params)
         try:
             with pacer.slot(interval):
                 with client.request(url, headers={"Accept": "application/xml"}) as response:
-                    records.extend(_parse_pubmed_xml(_read_xml_response(response, client), limit - len(records), status=status))
+                    records.extend(_parse_pubmed_xml(_read_xml_response(response, client), len(requested),
+                                                     status=status, requested_ids=requested))
         except Exception as exc:
             _page_error(status, exc, len(records), {"efetch_start": start})
             break
@@ -524,7 +550,10 @@ def search_pubmed(
     status["parsed_ids"] = [record.pmid for record in records if record.pmid]
     status["missing_requested_ids"] = [ident for ident in ids if ident not in parsed_ids]
     status["missing_response_ids"] = [ident for ident in ids if ident not in status["returned_ids"]]
-    status["unexpected_response_ids"] = sorted(set(status["returned_ids"]) - set(ids))
+    for key, label in (("unexpected_response_ids", "unrequested"), ("duplicate_response_ids", "duplicate")):
+        status[key] = sorted(set(status.get(key, [])))
+        if status[key]:
+            status["errors"].append(f"PubMed EFetch returned {label} PMIDs; see {key}")
     if status["missing_requested_ids"]:
         status["errors"].append("Requested PubMed identifiers missing from parsed records; see missing_requested_ids")
     if status["errors"]:
